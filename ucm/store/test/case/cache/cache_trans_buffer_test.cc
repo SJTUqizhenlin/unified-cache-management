@@ -208,6 +208,94 @@ TEST(UCCacheTransBufferSharedTest, SharesFailureAcrossMappings)
     ASSERT_EQ(waiter.FailureStatus(), UC::Status::NotFound());
 }
 
+TEST(UCCacheTransBufferSharedTest, IsolatesPartitionsAndWatcherSeesAll)
+{
+    using UC::CacheStore::TransBuffer;
+    UC::Test::Detail::Random rd;
+    UC::CacheStore::Config config;
+    config.uniqueId = rd.RandomString(10);
+    config.shardSize = 32768;
+    config.bufferCapacity = config.shardSize * 8;
+    config.shareBufferEnable = true;
+    config.deviceId = 0;
+    config.loadExclusiveBufferNumber = 0;
+    config.partitionCount = 2;
+
+    config.partitionId = 0;
+    TransBuffer first;
+    ASSERT_EQ(first.Setup(config), UC::Status::OK());
+    config.partitionId = 1;
+    TransBuffer second;
+    ASSERT_EQ(second.Setup(config), UC::Status::OK());
+
+    const auto firstBlock =
+        UC::Test::Detail::TypesHelper::MakeBlockId("a1b2c3d4e5f6789012345678901234ab");
+    const auto secondBlock =
+        UC::Test::Detail::TypesHelper::MakeBlockId("b1b2c3d4e5f6789012345678901234ab");
+    auto firstHandle = first.Get(firstBlock, 0);
+    auto secondHandle = second.Get(secondBlock, 0);
+    firstHandle.MarkReady();
+    secondHandle.MarkReady();
+
+    ASSERT_NE(firstHandle.Data(), secondHandle.Data());
+    ASSERT_TRUE(first.Exist(firstBlock, 0));
+    ASSERT_FALSE(first.Exist(secondBlock, 0));
+    ASSERT_TRUE(second.Exist(secondBlock, 0));
+    ASSERT_FALSE(second.Exist(firstBlock, 0));
+
+    config.deviceId = -1;
+    config.partitionId = 0;
+    TransBuffer watcher;
+    ASSERT_EQ(watcher.Setup(config), UC::Status::OK());
+    ASSERT_TRUE(watcher.Exist(firstBlock, 0));
+    ASSERT_TRUE(watcher.Exist(secondBlock, 0));
+}
+
+TEST(UCCacheTransBufferSharedTest, FinalizesDeferredRegistrationOnce)
+{
+    using UC::CacheStore::TransBuffer;
+    UC::Test::Detail::Random rd;
+    UC::CacheStore::Config config;
+    config.uniqueId = rd.RandomString(10);
+    config.shardSize = 32768;
+    config.bufferCapacity = config.shardSize * 8;
+    config.shareBufferEnable = true;
+    config.deviceId = 0;
+    config.loadExclusiveBufferNumber = 0;
+    config.partitionCount = 2;
+    config.deferShmRegistration = true;
+
+    TransBuffer buffer;
+    ASSERT_EQ(buffer.Setup(config), UC::Status::OK());
+    ASSERT_EQ(buffer.FinalizeMemoryRegistration(), UC::Status::OK());
+    ASSERT_EQ(buffer.FinalizeMemoryRegistration(), UC::Status::OK());
+}
+
+TEST(UCCacheTransBufferSharedTest, RoundsCapacityDownToCompletePartitions)
+{
+    using UC::CacheStore::TransBuffer;
+    UC::Test::Detail::Random rd;
+    UC::CacheStore::Config config;
+    config.uniqueId = rd.RandomString(10);
+    config.shardSize = 32768;
+    config.bufferCapacity = config.shardSize * 9;
+    config.shareBufferEnable = true;
+    config.deviceId = 0;
+    config.loadExclusiveBufferNumber = 0;
+    config.partitionCount = 4;
+    config.partitionId = 0;
+
+    TransBuffer buffer;
+    ASSERT_EQ(buffer.Setup(config), UC::Status::OK());
+    auto blockId =
+        UC::Test::Detail::TypesHelper::MakeBlockId("a1b2c3d4e5f6789012345678901234ab");
+    auto first = buffer.Get(blockId, 0);
+    auto second = buffer.Get(blockId, 1);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_NE(first.Data(), second.Data());
+}
+
 TEST_P(UCCacheTransBufferTest, GetReservedNode)
 {
     UC::CacheStore::TransBuffer transBuffer;

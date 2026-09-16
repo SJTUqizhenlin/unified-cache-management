@@ -360,6 +360,7 @@ def _install_stubs():
     _install_module(
         "ucm.integration.vllm.device",
         create_device=lambda *args, **kwargs: None,
+        get_current_device_id=lambda: 0,
     )
     _install_module("ucm.logger", init_logger=lambda name: _Logger())
     _install_module("ucm.shared.metrics", ucmmetrics=fake_ucmmetrics)
@@ -405,6 +406,198 @@ from ucm.store.yuanrongstore.resource_reporter import (
     parse_yuanrong_resource_snapshot,
     start_yuanrong_resource_reporter,
 )
+
+
+@pytest.mark.parametrize(
+    ("is_mla", "mla_using_d2d", "expected_count"),
+    [(False, False, 4), (True, False, 1), (True, True, 4)],
+)
+def test_shared_buffer_partition_topology(
+    monkeypatch, is_mla, mla_using_d2d, expected_count
+):
+    monkeypatch.setattr(ucm_connector_module, "_check_shm_capacity", lambda _: None)
+    connector = object.__new__(UCMDirectConnector)
+    connector.tp_size = 4
+    connector.tp_rank = 2
+    connector.is_mla = is_mla
+    connector.mla_using_d2d = mla_using_d2d
+    connector._role = KVConnectorRole.WORKER
+    config = {"share_buffer_enable": True, "cache_buffer_capacity_gb": 1}
+
+    connector._configure_shared_buffer(config)
+
+    assert config["partition_count"] == expected_count
+    assert config["partition_id"] == (2 if expected_count > 1 else 0)
+
+    connector._role = KVConnectorRole.SCHEDULER
+    connector._configure_shared_buffer(config)
+    assert config["partition_count"] == expected_count
+    assert config["partition_id"] == 0
+
+
+def test_d2d_load_preparation_error_keeps_collectives_symmetric(monkeypatch):
+    connector = object.__new__(UCMDirectConnector)
+    connector.tp_size = 2
+    connector._skip_null_vllm_blocks = False
+    connector.kv_cache_layout = SimpleNamespace(
+        extract_block_addrs=lambda _: (_ for _ in ()).throw(RuntimeError("bad ptr"))
+    )
+    connector._rank_consistency = SimpleNamespace(
+        submit_load_d2d=lambda *args: pytest.fail("D2D load must not be submitted")
+    )
+    connector.store = object()
+    connector.block_data_size = 1
+    connector._invalid_block_ids = set()
+    connector._record_load_error = lambda *args: None
+    failed_requests = []
+    connector._connector_worker_meta = SimpleNamespace(
+        mark_failed=failed_requests.append
+    )
+    metadata = SimpleNamespace(
+        request_meta={
+            "request-1": SimpleNamespace(load_block_ids=([b"block-1"], [1]))
+        }
+    )
+
+    gather_calls = []
+
+    def all_gather_object(output, value, group=None):
+        gather_calls.append(value)
+        output[:] = [value, value]
+
+    fake_dist = ModuleType("torch.distributed")
+    fake_dist.all_gather_object = all_gather_object
+    monkeypatch.setitem(sys.modules, "torch.distributed", fake_dist)
+    monkeypatch.setattr(sys.modules["torch"], "distributed", fake_dist, raising=False)
+    parallel_state = sys.modules["vllm.distributed.parallel_state"]
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=0, cpu_group=object()),
+        raising=False,
+    )
+
+    connector._start_load_kv_d2d(metadata)
+
+    assert len(gather_calls) == 2
+    assert failed_requests == ["request-1"]
+
+
+def _block_id_for_owner(owner_rank: int) -> bytes:
+    return owner_rank.to_bytes(8, "little") + b"\0" * 8
+
+
+def test_mla_d2d_wait_for_save_dumps_only_hash_owned_blocks():
+    _reset_fakes()
+
+    class FakePtrs(list):
+        @property
+        def shape(self):
+            return (len(self), len(self[0]) if self else 0)
+
+        def reshape(self, *args):
+            return self
+
+        def tolist(self):
+            return list(self)
+
+    submitted = []
+    connector = object.__new__(UCMDirectConnector)
+    connector.is_mla = True
+    connector.mla_using_d2d = True
+    connector.tp_size = 4
+    connector.tp_rank = 1
+    connector._skip_null_vllm_blocks = False
+    connector._async_dump_req_ids = set()
+    connector._pending_dump_tasks = []
+    connector._poll_pending_dump_tasks = lambda: None
+    connector.block_data_size = 16
+    connector.store = object()
+    connector._get_dump_event_handle = lambda: 0
+    connector.enable_event_sync = False
+    connector.device = None
+    connector.kv_cache_layout = SimpleNamespace(
+        extract_block_addrs=lambda block_ids: FakePtrs(
+            [[block_id, block_id + 100] for block_id in block_ids]
+        )
+    )
+
+    class RankConsistency:
+        @staticmethod
+        def submit_dump(store, block_ids_by_request, block_ids, shard_indices, ptrs, event_handle):
+            submitted.append(
+                (block_ids_by_request, block_ids, shard_indices, ptrs, event_handle)
+            )
+            return "dump-task"
+
+    connector._rank_consistency = RankConsistency()
+    block_ids = [
+        _block_id_for_owner(0),
+        _block_id_for_owner(1),
+        _block_id_for_owner(5),
+        _block_id_for_owner(3),
+    ]
+    metadata = ucm_connector_module.UCMConnectorMetadata(
+        request_meta={
+            "req-1": SimpleNamespace(dump_block_ids=(block_ids, [10, 11, 12, 13]))
+        }
+    )
+    connector._get_connector_metadata = lambda: metadata
+
+    connector.wait_for_save()
+
+    assert len(submitted) == 1
+    block_ids_by_request, submitted_block_ids, shard_indices, ptrs, event_handle = submitted[0]
+    assert block_ids_by_request == {"req-1": {block_ids[1], block_ids[2]}}
+    assert submitted_block_ids == [block_ids[1], block_ids[2]]
+    assert shard_indices == [0, 0]
+    assert ptrs.tolist() == [[11, 111], [12, 112]]
+    assert event_handle == 0
+    assert fake_ucmmetrics.updated == [{"save_bytes_total": 32}]
+    assert connector._pending_dump_tasks[0].request_ids == {"req-1"}
+
+
+def test_mla_d2d_layerwise_dump_uses_hash_owned_blocks():
+    connector = object.__new__(UCMLayerWiseConnector)
+    connector.is_mla = True
+    connector.mla_using_d2d = True
+    connector.tp_size = 4
+    connector.tp_rank = 2
+    connector._connector_metadata = object()
+    connector.layer_name_to_id = {"layer.0": 0}
+    connector._dumped_layer_ids = set()
+
+    submitted = []
+
+    def submit_layerwise(layer_id, block_ids, vllm_block_ids, request_ids, block_ids_by_request):
+        submitted.append((layer_id, block_ids, vllm_block_ids, request_ids, block_ids_by_request))
+        return True
+
+    connector._submit_layerwise_dump_task = submit_layerwise
+    block_ids = [
+        _block_id_for_owner(2),
+        _block_id_for_owner(6),
+        _block_id_for_owner(1),
+    ]
+    metadata = ucm_connector_module.UCMConnectorMetadata(
+        request_meta={
+            "req-1": SimpleNamespace(dump_block_ids=(block_ids, [20, 60, 10]))
+        }
+    )
+    connector._get_connector_metadata = lambda: metadata
+
+    connector.save_kv_layer("layer.0", None, None)
+
+    assert submitted == [
+        (
+            0,
+            [block_ids[0], block_ids[1]],
+            [20, 60],
+            {"req-1"},
+            {"req-1": {block_ids[0], block_ids[1]}},
+        )
+    ]
+    assert connector._dumped_layer_ids == {0}
 
 
 def _metric_types():

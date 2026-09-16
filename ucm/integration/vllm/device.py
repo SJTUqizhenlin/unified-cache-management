@@ -61,6 +61,9 @@ class Device(ABC):
         """
         pass
 
+    def get_numa_node(self, local_rank: int) -> Optional[int]:
+        return None
+
     def split_cores(self, local_rank: int) -> Tuple[List[int], List[int]]:
         """
         Shared split logic for both CUDA and NPU.
@@ -483,6 +486,41 @@ class NpuDevice(Device):
             for device_id in devices[start:end]:
                 if device_id in device_map_info:
                     device_map_info[device_id].numa_id = numa_id
+
+    def get_numa_node(self, local_rank: int) -> Optional[int]:
+        device_id = self._get_device_id(local_rank)
+        try:
+            devices = self._get_visible_devices()
+            device_map_info = self._get_device_map_info()
+            if not device_map_info:
+                return None
+            self._get_pcie_info(device_map_info)
+            self._get_numa_info(device_map_info)
+            topo = device_map_info.get(device_id)
+            if topo is None or topo.numa_id is None:
+                return None
+
+            node_to_socket, socket_to_nodes = self._get_node_socket_map()
+            socket = node_to_socket.get(topo.numa_id)
+            local_numa_ids = socket_to_nodes.get(socket, [topo.numa_id])
+            local_devices = [
+                device
+                for device in devices
+                if device in device_map_info
+                and device_map_info[device].numa_id is not None
+                and node_to_socket.get(device_map_info[device].numa_id) == socket
+            ]
+            if len(local_numa_ids) > 1 and device_id in local_devices:
+                device_index = local_devices.index(device_id)
+                return local_numa_ids[
+                    device_index * len(local_numa_ids) // len(local_devices)
+                ]
+            return topo.numa_id
+        except Exception as error:
+            logger.warning(
+                f"failed to get NUMA node for NPU device {device_id}: {error}"
+            )
+            return None
 
     def _get_cpu_info(self, numa_ids: List[int]) -> Dict[int, List[int]]:
         cpu_idx_tbl: Dict[int, List[int]] = {}

@@ -144,6 +144,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         shardTask.task = task;
         shardTask.shard = std::move(shard);
         shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+        shardTask.d2dShardIndex = indexes[i];
         running_.Push(std::move(shardTask));
     }
     auto tpDispatch = NowTime::Now();
@@ -213,7 +214,7 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
                                  (tpBackendReady - tpBackendWait) * 1e3);
 
         auto* host = cacheSdmaDirect_ ? task.bufferHandle.DeviceData() : task.bufferHandle.Data();
-        s = HostToDeviceAsync(stream, host, task.shard.addrs.data());
+        s = HostToDeviceAndPeersAsync(stream, host, task);
         auto tpH2dSubmitted = NowTime::Now();
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to do H2D for task({}).", s, taskHandle);
@@ -270,9 +271,35 @@ Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
     }
 }
 
-Status LoadQueue::HostToDeviceAsync(CopyStream& stream, void* host, void** device)
+Status LoadQueue::HostToDeviceAndPeersAsync(CopyStream& copyStream, void* host, ShardTask& task)
 {
-    return stream.HostToDeviceAsync(host, device, tensorSizes_);
+    auto stream = copyStream.NextStream();
+    if (!stream) { return Status::Error("copy stream is not setup"); }
+    auto s = stream->HostToDeviceAsync(host, task.shard.addrs.data(), tensorSizes_);
+    if (s.Failure()) { return s; }
+
+    const auto& peerAddrs = task.task->desc.d2dPeerAddrs;
+    const auto numPeers = task.task->desc.d2dNumPeers;
+    if (numPeers == 0) { return Status::OK(); }
+    const auto numShards = task.task->desc.size();
+    const auto numTensors = tensorSizes_.size();
+    if (task.shard.addrs.size() != numTensors ||
+        peerAddrs.size() != numPeers * numShards * numTensors) {
+        return Status::InvalidParam("invalid D2D task dimensions");
+    }
+    for (size_t peer = 0; peer < numPeers; ++peer) {
+        for (size_t tensor = 0; tensor < numTensors; ++tensor) {
+            const auto offset = (peer * numShards + task.d2dShardIndex) * numTensors + tensor;
+            if (tensorSizes_[tensor] == 0 || task.shard.addrs[tensor] == nullptr ||
+                peerAddrs[offset] == nullptr) {
+                continue;
+            }
+            s = stream->DeviceToDeviceAsync(task.shard.addrs[tensor], peerAddrs[offset],
+                                            tensorSizes_[tensor]);
+            if (s.Failure()) { return s; }
+        }
+    }
+    return Status::OK();
 }
 
 void LoadQueue::RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,

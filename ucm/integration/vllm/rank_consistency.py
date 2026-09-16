@@ -176,6 +176,35 @@ class RankConsistencyManager:
         self._load_task_contexts[id(task)] = (store, request_context)
         return task
 
+    def submit_load_d2d(
+        self,
+        store: UcmKVStoreBaseV1,
+        block_ids_by_request: dict[str, list[bytes]],
+        block_ids: list[bytes],
+        shard_indices: list[int],
+        ptrs: Any,
+        peer_ptrs: Any,
+        num_peers: int,
+    ) -> Any:
+        request_context = (
+            {
+                request_id: list(request_block_ids)
+                for request_id, request_block_ids in block_ids_by_request.items()
+            }
+            if self.enabled
+            else {}
+        )
+        try:
+            task = store.load_data_d2d(
+                block_ids, shard_indices, ptrs, peer_ptrs, num_peers
+            )
+        except Exception as error:
+            if self.enabled and isinstance(error, StoreNotFoundError):
+                self._mark_load_context_missing(request_context)
+            raise
+        self._load_task_contexts[id(task)] = (store, request_context)
+        return task
+
     def wait_load(self, task: Any) -> None:
         """Wait through the task's Store and record blocks missing at wait time."""
         task_key = id(task)

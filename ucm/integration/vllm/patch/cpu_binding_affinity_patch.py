@@ -157,6 +157,10 @@ def bind_threads(self) -> None:
     current_npu = self.device_info.running_npu_list[self.rank_id]
     self.bind(main_pid, self.assign_main[current_npu], True)
 
+    from ucm.store.pipeline.connector import finalize_deferred_memory_registrations
+
+    finalize_deferred_memory_registrations()
+
     ucm_cores = getattr(self, "assign_ucm", {}).get(current_npu, [])
     health_cores = getattr(self, "assign_ucm_health", {}).get(current_npu, [])
     if _ucm_affinity_enabled() and (ucm_cores or health_cores):

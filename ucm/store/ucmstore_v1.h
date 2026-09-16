@@ -30,6 +30,12 @@
 
 namespace UC {
 
+class MemoryRegistration {
+public:
+    virtual ~MemoryRegistration() = default;
+    virtual Status FinalizeMemoryRegistration() = 0;
+};
+
 /**
  * @brief Abstract interface for a key-value store that supports
  *        asynchronous load/dump of cached blocks.

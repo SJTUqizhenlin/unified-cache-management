@@ -64,6 +64,9 @@ struct TaskDesc : std::vector<Shard> {
     std::string brief;    /* Description of Task */
     /** Optional: prerequisite handle for dump. Cache stream waits before D2H. */
     uintptr_t prerequisiteHandle{0};
+    /** Optional peer addresses, flattened as [peer][shard][tensor]. */
+    std::vector<void*> d2dPeerAddrs;
+    size_t d2dNumPeers{0};
 };
 
 }  // namespace UC::Detail

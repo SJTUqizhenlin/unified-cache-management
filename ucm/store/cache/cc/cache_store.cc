@@ -39,7 +39,7 @@
 
 namespace UC::CacheStore {
 
-class CacheStore : public StoreV1 {
+class CacheStore : public StoreV1, public MemoryRegistration {
     BufferManager bufferMgr_;
     bool transEnable_{false};
     TransManager transMgr_;
@@ -75,6 +75,10 @@ public:
         }
         ShowConfig(config);
         return Status::OK();
+    }
+    Status FinalizeMemoryRegistration() override
+    {
+        return bufferMgr_.FinalizeMemoryRegistration();
     }
     std::string Readme() const override { return "CacheStore"; }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
@@ -169,6 +173,10 @@ private:
         param.cacheIOAggregation = param.cacheIOAggregation && UCM_RUNTIME_ASCEND_IO_AGGREGATION;
         config.Get("cache_sdma_direct", param.cacheSdmaDirect);
         config.GetNumber("local_rank_size", param.localRankSize);
+        config.GetNumber("partition_id", param.partitionId);
+        config.GetNumber("partition_count", param.partitionCount);
+        config.GetNumber("numa_id", param.numaId);
+        config.Get("defer_shm_registration", param.deferShmRegistration);
         return param;
     }
     Status CheckSizeConfig(const Config& config)
@@ -200,6 +208,16 @@ private:
                 return Status::InvalidParam("invalid cpu core({})", core);
             }
         }
+        if (config.partitionCount == 0 || config.partitionId >= config.partitionCount) {
+            return Status::InvalidParam("invalid partition({}/{})", config.partitionId,
+                                        config.partitionCount);
+        }
+        if (!config.shareBufferEnable && config.partitionCount != 1) {
+            return Status::InvalidParam("cache partition requires shared buffer");
+        }
+        if (config.numaId < -1) {
+            return Status::InvalidParam("invalid NUMA node({})", config.numaId);
+        }
         if (config.deviceId == -1) { return Status::OK(); }
         s = CheckSizeConfig(config);
         if (s.Failure()) { return s; }
@@ -209,10 +227,13 @@ private:
         }
 #endif
         auto bufferNumber = config.bufferCapacity / config.shardSize;
+        bufferNumber /= config.partitionCount;
         const size_t minBufferNumber = std::max(size_t(1024), config.loadExclusiveBufferNumber * 2);
         if (bufferNumber < minBufferNumber) {
             const size_t minBufferCapacityGb =
-                (minBufferNumber * config.shardSize + (size_t(1) << 30) - 1) >> 30;
+                (minBufferNumber * config.partitionCount * config.shardSize +
+                 (size_t(1) << 30) - 1) >>
+                30;
             return Status::InvalidParam(
                 "too small buffer({}) on shard({}), please set cache_buffer_capacity_gb >= {}GB",
                 config.bufferCapacity, config.shardSize, minBufferCapacityGb);
@@ -276,6 +297,8 @@ private:
         UC_INFO("Set {}::GpuKvBufferNumber to {}.", ns, config.gpuKvBufferAddrs.size());
         UC_INFO("Set {}::UseGdr to {}.", ns, config.useGdr);
         UC_INFO("Set {}::LocalRankSize to {}.", ns, config.localRankSize);
+        UC_INFO("Set {}::Partition to {}/{}.", ns, config.partitionId, config.partitionCount);
+        UC_INFO("Set {}::NumaId to {}.", ns, config.numaId);
     }
 };
 

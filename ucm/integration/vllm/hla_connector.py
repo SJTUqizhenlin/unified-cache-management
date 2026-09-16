@@ -849,13 +849,14 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         module_path = self.connector_configs[0].get("ucm_connector_module_path", None)
         config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
         config.setdefault("share_buffer_enable", self.is_mla)
-        self._set_default_shm_buffer_capacity(config)
+        self._configure_shared_buffer(config)
         if "storage_backends" in config:
             backends = [path for path in config["storage_backends"].split(":")]
             config["storage_backends"] = backends
         config["unique_id"] = f"{self.unique_id}{unique_id_suffix}"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.device_id
+            self._configure_worker_numa(config)
             tensor_size_list = _normalize_tensor_size_list(
                 tensor_size_list_override
                 if tensor_size_list_override is not None

@@ -6,6 +6,7 @@ import os
 import pickle
 import re
 import shutil
+import socket
 import time
 import uuid
 from collections import defaultdict
@@ -1192,6 +1193,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         else:
             self.unique_id = self.engine_id
         self.enable_event_sync = self.launch_config.get("enable_event_sync", True)
+        self.mla_using_d2d = self.launch_config.get("mla_using_d2d", False)
         self.enable_record_traces = self.launch_config.get(
             "enable_record_traces", False
         )
@@ -1282,6 +1284,28 @@ class UCMDirectConnector(KVConnectorBase_V1):
             }
         )
 
+    def _owns_mla_d2d_block(self, block_id: bytes) -> bool:
+        return (
+            int.from_bytes(block_id[:8], "little") % self.tp_size
+            == self.tp_rank % self.tp_size
+        )
+
+    def _select_local_dump_blocks(
+        self,
+        ucm_block_ids: list[bytes],
+        vllm_block_ids: list[int],
+    ) -> tuple[list[bytes], list[int]]:
+        if not (self.is_mla and self.mla_using_d2d and self.tp_size > 1):
+            return ucm_block_ids, vllm_block_ids
+
+        selected_ucm_block_ids: list[bytes] = []
+        selected_vllm_block_ids: list[int] = []
+        for ucm_block_id, vllm_block_id in zip(ucm_block_ids, vllm_block_ids):
+            if self._owns_mla_d2d_block(ucm_block_id):
+                selected_ucm_block_ids.append(ucm_block_id)
+                selected_vllm_block_ids.append(vllm_block_id)
+        return selected_ucm_block_ids, selected_vllm_block_ids
+
     def generate_hash(
         self, block_size: int, token_ids: List[int], parent_block_hash_value: bytes
     ) -> list[bytes]:
@@ -1302,9 +1326,17 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
         return ret
 
-    def _set_default_shm_buffer_capacity(self, config: dict[str, Any]) -> None:
+    def _configure_shared_buffer(self, config: dict[str, Any]) -> None:
         if not bool(config.get("share_buffer_enable", False)):
             return
+        partition_enabled = config.get("shm_partition_enable", True)
+        use_partition = partition_enabled and (
+            not self.is_mla or self.mla_using_d2d
+        )
+        config["partition_count"] = self.tp_size if use_partition else 1
+        config["partition_id"] = 0
+        if use_partition and self._role == KVConnectorRole.WORKER:
+            config["partition_id"] = self.tp_rank % self.tp_size
         if config.get("cache_buffer_capacity_gb") is None:
             config["cache_buffer_capacity_gb"] = 128
             logger.info(
@@ -1313,6 +1345,24 @@ class UCMDirectConnector(KVConnectorBase_V1):
         # The shared buffer is allocated via shm_open in /dev/shm; fail early
         # (before store creation) if the tmpfs cannot hold it.
         _check_shm_capacity(int(config["cache_buffer_capacity_gb"]))
+
+    def _configure_worker_numa(self, config: dict[str, Any]) -> None:
+        numa_id = self.device.get_numa_node(self.local_rank)
+        if numa_id is not None:
+            config["numa_id"] = numa_id
+            logger.info(
+                "Use UCM-detected NUMA node %s for device %s.",
+                numa_id,
+                self.device_id,
+            )
+            return
+        if config.get("partition_count", 1) > 1:
+            config["defer_shm_registration"] = True
+        logger.info(
+            "UCM NUMA detection unavailable for device %s; "
+            "defer shared-buffer registration until vLLM CPU binding.",
+            self.device_id,
+        )
 
     def _create_store(
         self,
@@ -1330,13 +1380,14 @@ class UCMDirectConnector(KVConnectorBase_V1):
         module_path = self.connector_configs[0].get("ucm_connector_module_path", None)
         config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
         config.setdefault("share_buffer_enable", self.is_mla)
-        self._set_default_shm_buffer_capacity(config)
+        self._configure_shared_buffer(config)
         if "storage_backends" in config:
             backends = [path for path in config["storage_backends"].split(":")]
             config["storage_backends"] = backends
         config["unique_id"] = f"{self.unique_id}"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.device_id
+            self._configure_worker_numa(config)
             tensor_size_list = kv_cache_layout.tensor_size_list * self.blocks_per_chunk
             logical_shard_size = kv_cache_layout.shard_size * self.blocks_per_chunk
             logical_block_size = kv_cache_layout.block_size * self.blocks_per_chunk
@@ -1765,6 +1816,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
 
+        if self.mla_using_d2d and self.is_mla and self.tp_size > 1:
+            self._start_load_kv_d2d(metadata)
+            return
+
         request_to_task: dict[str, Task] = {}
         is_load = False
         num_loaded_block = 0
@@ -1836,6 +1891,168 @@ class UCMDirectConnector(KVConnectorBase_V1):
         load_bytes = num_loaded_block * self.block_data_size
         if is_load:
             ucmmetrics.update_stats({"load_bytes_total": load_bytes})
+
+    def _start_load_kv_d2d(self, metadata: "UCMConnectorMetadata") -> None:
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        tp_rank = tp_group.rank_in_group
+        requests: list[tuple[str, list[bytes], list[int], np.ndarray]] = []
+        request_vllm_blocks = {
+            request_id: request.load_block_ids[1]
+            for request_id, request in metadata.request_meta.items()
+            if request.load_block_ids[0]
+        }
+        all_local_ptrs: list[int] = []
+        tensor_count = 0
+        total_blocks = 0
+        preparation_error: Optional[str] = None
+
+        try:
+            for request_id, request in metadata.request_meta.items():
+                ucm_block_ids, vllm_block_ids = request.load_block_ids
+                if not ucm_block_ids:
+                    continue
+                if self._skip_null_vllm_blocks:
+                    ucm_block_ids, vllm_block_ids = _drop_null_vllm_blocks(
+                        ucm_block_ids,
+                        vllm_block_ids,
+                        f"UCM D2D load request {request_id}",
+                    )
+                request_vllm_blocks[request_id] = vllm_block_ids
+                if not ucm_block_ids:
+                    continue
+                ptrs = self.kv_cache_layout.extract_block_addrs(vllm_block_ids)
+                ptrs = np.ascontiguousarray(
+                    ptrs.reshape(ptrs.shape[0], -1), dtype=np.uint64
+                )
+                if tensor_count == 0:
+                    tensor_count = ptrs.shape[1]
+                elif tensor_count != ptrs.shape[1]:
+                    raise RuntimeError("Inconsistent tensor count in MLA D2D load.")
+                requests.append((request_id, ucm_block_ids, vllm_block_ids, ptrs))
+                all_local_ptrs.extend(ptrs.reshape(-1).tolist())
+                total_blocks += len(ucm_block_ids)
+        except Exception as error:
+            preparation_error = f"{type(error).__name__}: {error}"
+
+        local_metadata = {
+            "host": socket.gethostname(),
+            "error": preparation_error,
+            "total_blocks": total_blocks,
+            "tensor_count": tensor_count,
+            "ptrs": all_local_ptrs,
+        }
+        gathered_metadata: list[dict[str, Any] | None] = [None] * self.tp_size
+        dist.all_gather_object(
+            gathered_metadata, local_metadata, group=tp_group.cpu_group
+        )
+        metadata_error: Optional[str] = None
+        if any(item is None for item in gathered_metadata):
+            metadata_error = "Missing MLA D2D address metadata from a TP rank."
+        else:
+            rank_metadata = [item for item in gathered_metadata if item is not None]
+            rank_errors = [item["error"] for item in rank_metadata if item["error"]]
+            hosts = {item["host"] for item in rank_metadata}
+            shapes = {
+                (item["total_blocks"], item["tensor_count"])
+                for item in rank_metadata
+            }
+            if rank_errors:
+                metadata_error = f"MLA D2D address preparation failed: {rank_errors[0]}"
+            elif len(hosts) != 1:
+                metadata_error = "MLA D2D requires all TP ranks to be on the same host."
+            elif len(shapes) != 1:
+                metadata_error = "Inconsistent MLA D2D address shape across TP ranks."
+            else:
+                expected_ptrs = total_blocks * tensor_count
+                if any(len(item["ptrs"]) != expected_ptrs for item in rank_metadata):
+                    metadata_error = (
+                        "Inconsistent MLA D2D address metadata across TP ranks."
+                    )
+
+        if metadata_error is None and total_blocks == 0:
+            return
+
+        failed_requests: set[str] = set()
+        if metadata_error is not None:
+            logger.error(metadata_error)
+            failed_requests.update(request_vllm_blocks)
+        else:
+            rank_ptrs = [
+                np.asarray(item["ptrs"], dtype=np.uint64).reshape(
+                    total_blocks, tensor_count
+                )
+                for item in rank_metadata
+            ]
+            block_offset = 0
+            for request_id, block_ids, vllm_block_ids, local_ptrs in requests:
+                block_count = len(block_ids)
+                try:
+                    executor_indices = [
+                        index
+                        for index, block_id in enumerate(block_ids)
+                        if int.from_bytes(block_id[:8], "little") % self.tp_size
+                        == tp_rank
+                    ]
+                    if executor_indices:
+                        executor_block_ids = [
+                            block_ids[index] for index in executor_indices
+                        ]
+                        executor_ptrs = local_ptrs[executor_indices]
+                        peer_ptrs = np.concatenate(
+                            [
+                                ptrs[
+                                    [
+                                        block_offset + index
+                                        for index in executor_indices
+                                    ]
+                                ].reshape(-1)
+                                for rank, ptrs in enumerate(rank_ptrs)
+                                if rank != tp_rank
+                            ]
+                        )
+                        task = self._rank_consistency.submit_load_d2d(
+                            self.store,
+                            {request_id: executor_block_ids},
+                            executor_block_ids,
+                            [0] * len(executor_block_ids),
+                            executor_ptrs,
+                            peer_ptrs,
+                            self.tp_size - 1,
+                        )
+                        self._rank_consistency.wait_load(task)
+                except Exception as error:
+                    logger.error(
+                        "request %s D2D load error. %s: %s",
+                        request_id,
+                        type(error).__name__,
+                        error,
+                    )
+                    failed_requests.add(request_id)
+                block_offset += block_count
+
+        gathered_failures: list[set[str] | None] = [None] * self.tp_size
+        dist.all_gather_object(
+            gathered_failures, failed_requests, group=tp_group.cpu_group
+        )
+        all_failed_requests = set().union(
+            *(failures or set() for failures in gathered_failures)
+        )
+        loaded_blocks = total_blocks
+        for request_id, vllm_block_ids in request_vllm_blocks.items():
+            if request_id not in all_failed_requests:
+                continue
+            self._record_load_error(
+                "connector_load_wait_errors_total", vllm_block_ids
+            )
+            self._connector_worker_meta.mark_failed(request_id)
+            loaded_blocks = max(0, loaded_blocks - len(vllm_block_ids))
+        if total_blocks:
+            ucmmetrics.update_stats(
+                {"load_bytes_total": loaded_blocks * self.block_data_size}
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -1953,7 +2170,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         }
         self._async_dump_req_ids.update(metadata_dump_request_ids)
 
-        if self.is_mla and self.tp_rank != 0:
+        if self.is_mla and not self.mla_using_d2d and self.tp_rank != 0:
             return
 
         is_save = False
@@ -1974,12 +2191,17 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 )
                 if len(ucm_block_ids) == 0:
                     continue
+            ucm_block_ids, vllm_block_ids = self._select_local_dump_blocks(
+                ucm_block_ids, vllm_block_ids
+            )
+            if len(ucm_block_ids) == 0:
+                continue
             is_save = True
             dump_request_ids.add(request_id)
             block_ids_by_request[request_id] = set(ucm_block_ids)
             num_saved_block += len(ucm_block_ids)
             store_block_ids = ucm_block_ids
-            if self.tp_rank != 0:
+            if self.tp_rank != 0 and not (self.is_mla and self.mla_using_d2d):
                 store_block_ids = [
                     self.request_hasher(block_id) for block_id in ucm_block_ids
                 ]
@@ -2170,16 +2392,12 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         total_ucm_block_ids: list[bytes],
         total_vllm_block_ids: list[int],
         dump_request_ids: set[str],
+        block_ids_by_request: dict[str, set[bytes]],
     ) -> bool:
         """Submit a layerwise dump and attach it to the existing async lifecycle."""
         if not dump_request_ids:
             return False
 
-        metadata = self._get_connector_metadata()
-        block_ids_by_request = {
-            request_id: set(metadata.request_meta[request_id].dump_block_ids[0])
-            for request_id in dump_request_ids
-        }
         local_layer_id = layer_id - self.first_layer_id
         if self.dump_total_ptrs is None:
             self.dump_total_ptrs = self.kv_cache_layout.extract_block_addrs(
@@ -2368,13 +2586,18 @@ class UCMLayerWiseConnector(UCMDirectConnector):
     ) -> None:
         if not self._connector_metadata:
             return
-        if self.is_mla and self.tp_rank % self.tp_size != 0:
+        if (
+            self.is_mla
+            and not self.mla_using_d2d
+            and self.tp_rank % self.tp_size != 0
+        ):
             return
 
         metadata = self._get_connector_metadata()
 
         total_ucm_block_ids, total_vllm_block_ids = [], []
         dump_request_ids: set[str] = set()
+        block_ids_by_request: dict[str, set[bytes]] = {}
         layer_id = self.layer_name_to_id[layer_name]
         if layer_id in self._dumped_layer_ids:
             logger.debug(
@@ -2387,10 +2610,18 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             if len(request.dump_block_ids[0]) == 0:
                 continue
 
-            dump_request_ids.add(request_id)
             ucm_block_ids, vllm_block_ids = request.dump_block_ids
+            ucm_block_ids, vllm_block_ids = self._select_local_dump_blocks(
+                ucm_block_ids, vllm_block_ids
+            )
+            if len(ucm_block_ids) == 0:
+                continue
+            dump_request_ids.add(request_id)
+            block_ids_by_request[request_id] = set(ucm_block_ids)
             store_block_ids = ucm_block_ids
-            if self.tp_rank % self.tp_size != 0:
+            if self.tp_rank % self.tp_size != 0 and not (
+                self.is_mla and self.mla_using_d2d
+            ):
                 store_block_ids = [
                     self.request_hasher(block_id) for block_id in ucm_block_ids
                 ]
@@ -2403,6 +2634,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 total_ucm_block_ids,
                 total_vllm_block_ids,
                 dump_request_ids,
+                block_ids_by_request,
             )
             if submitted:
                 self._dumped_layer_ids.add(layer_id)

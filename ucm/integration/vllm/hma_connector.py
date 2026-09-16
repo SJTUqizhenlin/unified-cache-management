@@ -703,7 +703,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         """Instantiate one UCM store with worker tensor layout metadata."""
 
         name, module_path, config = self._base_store_config(store_suffix)
-        self._set_default_shm_buffer_capacity(config)
+        self._configure_shared_buffer(config)
         if label == "FA":
             config.setdefault("cache_io_aggregation", True)
         else:
@@ -712,6 +712,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             if tensor_size_list is None:
                 raise RuntimeError(f"Worker FAWA {label} store needs tensor sizes.")
             config["device_id"] = self.device_id
+            self._configure_worker_numa(config)
             config["tensor_size_list"] = tensor_size_list
             # io_direct requires shard and block sizes to be 4KB aligned.
             aligned_size = 4096

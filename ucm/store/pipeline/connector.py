@@ -27,6 +27,7 @@ import copy
 import ctypes
 import importlib
 import os
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -37,6 +38,12 @@ import torch
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
 _preloaded_libraries: Dict[Path, ctypes.CDLL] = {}
+_deferred_registration_stores: weakref.WeakSet["UcmPipelineStore"] = weakref.WeakSet()
+
+
+def finalize_deferred_memory_registrations() -> None:
+    for store in list(_deferred_registration_stores):
+        store.finalize_memory_registration()
 
 
 def _preload_library(path: Path) -> None:
@@ -96,6 +103,12 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         if builder is None:
             raise ValueError(f"unknown store pipeline: {config['store_pipeline']}")
         builder(config, self.store_)
+        if config.get("defer_shm_registration", False):
+            _deferred_registration_stores.add(self)
+
+    def finalize_memory_registration(self) -> None:
+        self.store_.FinalizeMemoryRegistration()
+        _deferred_registration_stores.discard(self)
 
     def cc_store(self) -> int:
         return self.store_.Self()
@@ -163,6 +176,23 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         else:
             addrs = np.array(dst_addr, dtype=np.uint64)
         task_id = self.store_.Load(ids, indexes, addrs)
+        return UcmPipelineStoreTransTask(task_id)
+
+    def load_data_d2d(
+        self,
+        block_ids: List[bytes],
+        shard_index: List[int],
+        dst_addr: List[List[int]] | np.ndarray,
+        peer_addrs: np.ndarray,
+        num_peers: int,
+    ) -> Task:
+        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        indexes = array.array("Q", shard_index)
+        addrs = np.asarray(dst_addr, dtype=np.uint64)
+        owned_peer_addrs = np.ascontiguousarray(peer_addrs, dtype=np.uint64).reshape(-1)
+        task_id = self.store_.LoadD2D(
+            ids, indexes, addrs, owned_peer_addrs, num_peers
+        )
         return UcmPipelineStoreTransTask(task_id)
 
     def dump_data(

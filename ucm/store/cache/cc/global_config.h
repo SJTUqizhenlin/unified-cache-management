@@ -64,6 +64,10 @@ struct Config {
     bool cacheIOAggregation{false};
     bool cacheSdmaDirect{UCM_RUNTIME_ASCEND_SDMA_DIRECT};
     size_t localRankSize{8};
+    size_t partitionId{0};
+    size_t partitionCount{1};
+    int32_t numaId{-1};
+    bool deferShmRegistration{false};
 
     size_t EffectiveStreamNumber() const noexcept { return cacheSdmaDirect ? 1 : streamNumber; }
 };

@@ -49,6 +49,7 @@ class LoadQueue {
         Detail::TaskHandle backendTaskHandle;
         WaiterPtr waiter;
         bool fromPosix{false};
+        size_t d2dShardIndex{0};
     };
 
 private:
@@ -82,7 +83,7 @@ private:
     void TransferStage(std::promise<Status>& started);
     void TransferOneTask(CopyStream& stream, ShardTask&& task);
     Status WaitBackendTaskReady(ShardTask& task);
-    Status HostToDeviceAsync(CopyStream& stream, void* host, void** device);
+    Status HostToDeviceAndPeersAsync(CopyStream& stream, void* host, ShardTask& task);
     void RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,
                             bool success) const;
     void RecordLoadSourceShards(size_t total, size_t wait) const;

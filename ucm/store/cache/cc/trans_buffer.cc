@@ -24,6 +24,9 @@
 #include "trans_buffer.h"
 #include <atomic>
 #include <filesystem>
+#include <mutex>
+#include <sched.h>
+#include <sys/syscall.h>
 #include <thread>
 #include <unistd.h>
 #include "logger/logger.h"
@@ -96,6 +99,9 @@ public:
     virtual void* DeviceDataAt(size_t iNode) = 0;
     virtual BufferMetaNode* MetaAt(size_t iNode) = 0;
     virtual void MarkAccessed(size_t iNode) = 0;
+    virtual Status FinalizeMemoryRegistration() { return Status::OK(); }
+    virtual bool ExistInAllPartitions(const Detail::BlockId&, size_t) { return false; }
+    virtual bool MultiPartitionWatcher() const { return false; }
 };
 
 class LocalBufferStrategy : public BufferStrategy {
@@ -276,7 +282,7 @@ protected:
         bool TryLock() { return pthread_spin_trylock(&lock) == 0; }
         void Unlock() { pthread_spin_unlock(&lock); }
     };
-    static constexpr size_t sharedBufferMagic = (('S' << 16) | ('b' << 8) | 2);
+    static constexpr size_t sharedBufferMagic = (('S' << 16) | ('b' << 8) | 3);
     struct BufferHeader {
         std::atomic<size_t> magic;
         size_t nNode;
@@ -298,6 +304,14 @@ protected:
     std::string shmName_;
     size_t nodeSize_{0};
     size_t nNode_{0};
+    size_t totalNodeCount_{0};
+    size_t partitionId_{0};
+    size_t partitionCount_{1};
+    int32_t numaId_{-1};
+    bool deferRegistration_{false};
+    bool registered_{false};
+    std::mutex registrationMutex_;
+    size_t dataOffset_{0};
     void* addrress_{nullptr};
     size_t totalSize_{0};
 
@@ -314,13 +328,17 @@ protected:
         auto off = AccessedOffset() + AccessedSize();
         return (off + align - 1) & ~(align - 1);
     }
-    size_t DataOffset() const noexcept
+    size_t MetaRegionSize() const noexcept
     {
         static const auto pageSize = sysconf(_SC_PAGESIZE);
         const auto size = MetaOffset() + sizeof(BufferMetaNode) * nNode_;
         return (size + pageSize - 1) & ~(pageSize - 1);
     }
-    size_t DataSize() const noexcept { return nodeSize_ * nNode_; }
+    size_t DataOffset() const noexcept
+    {
+        return partitionCount_ * MetaRegionSize();
+    }
+    size_t DataSize() const noexcept { return nodeSize_ * totalNodeCount_; }
     static const std::string& ShmPrefix() noexcept
     {
         static std::string prefix{"uc_shm_cache_"};
@@ -350,7 +368,7 @@ protected:
         }
     }
     static Status MmapShmFile(PosixShm& shmFile, const size_t size, void*& addr,
-                              bool needTrunc = true)
+                              bool needTrunc = true, bool populate = true)
     {
         auto s = Status::OK();
         if (needTrunc) {
@@ -360,7 +378,7 @@ protected:
                 return s;
             }
         }
-        s = shmFile.MMap(addr, size, true, true, true, true);
+        s = shmFile.MMap(addr, size, true, true, true, populate);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to mmap file({}) with size({}).", s, shmFile.ShmName(), size);
             return s;
@@ -380,14 +398,16 @@ protected:
         } while (true);
         return Status::OK();
     }
-    Status InitShmBuffer(PosixShm& shmFile)
+    void SelectPartition(size_t partition)
     {
-        auto s = MmapShmFile(shmFile, totalSize_, addrress_);
-        if (s.Failure()) [[unlikely]] { return s; }
-        header_ = static_cast<BufferHeader*>(addrress_);
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
-                                                            AccessedOffset());
+        auto* region = static_cast<std::byte*>(addrress_) + partition * MetaRegionSize();
+        header_ = reinterpret_cast<BufferHeader*>(region);
+        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(region + AccessedOffset());
+        meta_ = reinterpret_cast<BufferMetaNode*>(region + MetaOffset());
+    }
+    void InitPartition(size_t partition)
+    {
+        SelectPartition(partition);
         header_->nNode = nNode_;
         header_->nodeCursor.store(0, std::memory_order_relaxed);
         for (size_t i = 0; i < nHashTableBucket; i++) {
@@ -399,7 +419,17 @@ protected:
             meta_[i].Init();
             accessed_[i].store(0, std::memory_order_relaxed);
         }
-        header_->magic = sharedBufferMagic;
+        header_->magic.store(sharedBufferMagic, std::memory_order_release);
+    }
+    Status InitShmBuffer(PosixShm& shmFile)
+    {
+        auto s = MmapShmFile(shmFile, totalSize_, addrress_, true, partitionCount_ == 1);
+        if (s.Failure()) [[unlikely]] { return s; }
+        for (size_t partition = partitionCount_; partition > 1; --partition) {
+            InitPartition(partition - 1);
+        }
+        InitPartition(0);
+        SelectPartition(partitionId_);
         return Status::OK();
     }
     Status LoadShmBuffer(PosixShm& shmFile)
@@ -409,46 +439,82 @@ protected:
             UC_ERROR("Failed({}) to open file({}).", s, shmFile.ShmName());
             return s;
         }
-        s = MmapShmFile(shmFile, totalSize_, addrress_, false);
+        s = MmapShmFile(shmFile, totalSize_, addrress_, false, partitionCount_ == 1);
         if (s.Failure()) [[unlikely]] { return s; }
-        header_ = static_cast<BufferHeader*>(addrress_);
-        s = WaitShmHeaderReady(header_);
+        auto* firstHeader = static_cast<BufferHeader*>(addrress_);
+        s = WaitShmHeaderReady(firstHeader);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Shm file({}) not ready.", shmFile.ShmName());
             return s;
         }
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
-                                                            AccessedOffset());
+        SelectPartition(partitionId_);
         return Status::OK();
+    }
+    static int LocalNumaNode()
+    {
+        const auto cpu = sched_getcpu();
+        if (cpu < 0) { return -1; }
+        std::error_code error;
+        for (const auto& entry :
+             std::filesystem::directory_iterator("/sys/devices/system/node", error)) {
+            const auto cpuPath = entry.path() / fmt::format("cpu{}", cpu);
+            if (!std::filesystem::exists(cpuPath, error)) { continue; }
+            const auto name = entry.path().filename().string();
+            if (name.rfind("node", 0) == 0) { return std::stoi(name.substr(4)); }
+        }
+        return -1;
+    }
+    void BindPartitionToLocalNuma()
+    {
+        if (partitionCount_ == 1) { return; }
+        const auto node = numaId_ >= 0 ? numaId_ : LocalNumaNode();
+        if (node < 0) { return; }
+        auto* start = static_cast<std::byte*>(addrress_) + dataOffset_ +
+                      partitionId_ * nNode_ * nodeSize_;
+        const auto length = nNode_ * nodeSize_;
+        constexpr auto bitsPerWord = sizeof(unsigned long) * 8;
+        std::vector<unsigned long> nodeMask(static_cast<size_t>(node) / bitsPerWord + 1);
+        nodeMask[static_cast<size_t>(node) / bitsPerWord] |= 1UL << (node % bitsPerWord);
+        constexpr int policyBind = 2;
+        if (syscall(SYS_mbind, start, length, policyBind, nodeMask.data(),
+                nodeMask.size() * bitsPerWord, 0) != 0) {
+            UC_WARN("Failed to bind cache partition({}/{}) to NUMA node({}), errno({}).",
+                    partitionId_, partitionCount_, node, errno);
+        }
     }
     Status RegisterBuffer(int32_t deviceId)
     {
-        data_ = static_cast<std::byte*>(addrress_) + DataOffset();
+        data_ = static_cast<std::byte*>(addrress_) + dataOffset_ +
+            partitionId_ * nNode_ * nodeSize_;
         Trans::Device device;
         auto s = device.Setup(deviceId);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
             return s;
         }
-        const auto dataSize = DataSize();
+        const auto dataSize = nNode_ * nodeSize_;
         s = Trans::Buffer::RegisterHostBuffer((void*)data_, dataSize, (void**)&dataOnDevice_);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to register buffer({}) to device({}).", s, dataSize, deviceId);
             return s;
         }
+        registered_ = true;
         return Status::OK();
     }
 
 public:
-    SharedBufferStrategy(const std::string& uuid, int32_t deviceId, size_t nodeSize,
-                         size_t totalSize, size_t reservedNumber)
-        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber), uuid_(uuid)
+        SharedBufferStrategy(const std::string& uuid, int32_t deviceId, size_t nodeSize,
+                                                 size_t totalSize, size_t reservedNumber, size_t partitionId = 0,
+                                                 size_t partitionCount = 1, int32_t numaId = -1,
+                                                 bool deferRegistration = false)
+                : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber), uuid_(uuid),
+                    partitionId_(partitionId), partitionCount_(partitionCount), numaId_(numaId),
+                    deferRegistration_(deferRegistration)
     {
     }
     ~SharedBufferStrategy() override
     {
-        if (data_) { Trans::Buffer::UnregisterHostBuffer(data_); }
+        if (registered_) { Trans::Buffer::UnregisterHostBuffer(data_); }
         if (addrress_) { PosixShm::MUnmap(addrress_, totalSize_); }
         PosixShm{shmName_}.ShmUnlink();
     }
@@ -460,11 +526,13 @@ public:
         const auto totalSize = base_.totalSize;
         shmName_ = ShmPrefix() + uuid;
         nodeSize_ = nodeSize;
-        nNode_ = totalSize / nodeSize;
+        totalNodeCount_ = totalSize / nodeSize;
+        nNode_ = totalNodeCount_ / partitionCount_;
+        totalNodeCount_ = nNode_ * partitionCount_;
         CleanUpShmFileExceptMe(shmName_);
         PosixShm shmFile{shmName_};
-        const auto dataOffset = DataOffset();
-        totalSize_ = dataOffset + DataSize();
+        dataOffset_ = DataOffset();
+        totalSize_ = dataOffset_ + DataSize();
         const auto flags =
             PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL | PosixShm::OpenFlag::READ_WRITE;
         auto s = shmFile.ShmOpen(flags);
@@ -476,7 +544,20 @@ public:
             UC_ERROR("Failed({}) to open file({}) with flags({}).", s, shmName_, flags);
             return s;
         }
+        if (deferRegistration_) {
+            UC_INFO("Defer cache partition({}/{}) NUMA binding and host registration.",
+                    partitionId_, partitionCount_);
+            return Status::OK();
+        }
+        BindPartitionToLocalNuma();
         return RegisterBuffer(deviceId);
+    }
+    Status FinalizeMemoryRegistration() override
+    {
+        std::lock_guard<std::mutex> lock(registrationMutex_);
+        if (registered_) { return Status::OK(); }
+        BindPartitionToLocalNuma();
+        return RegisterBuffer(base_.deviceId);
     }
     void BucketLock(size_t iBucket) override { header_->bucketLocks[iBucket].Lock(); }
     bool BucketTryLock(size_t iBucket) override { return header_->bucketLocks[iBucket].TryLock(); }
@@ -502,15 +583,21 @@ public:
     {
         accessed_[iNode].store(1, std::memory_order_relaxed);
     }
-    void* DataAt(size_t iNode) override { return data_ + nodeSize_ * iNode; }
-    void* DeviceDataAt(size_t iNode) override { return dataOnDevice_ + nodeSize_ * iNode; }
+    void* DataAt(size_t iNode) override
+    {
+        return data_ + nodeSize_ * iNode;
+    }
+    void* DeviceDataAt(size_t iNode) override
+    {
+        return dataOnDevice_ + nodeSize_ * iNode;
+    }
     BufferMetaNode* MetaAt(size_t iNode) override { return meta_ + iNode; }
 };
 
 class SharedBufferWatcherStrategy : public SharedBufferStrategy {
 public:
-    explicit SharedBufferWatcherStrategy(const std::string& uuid)
-        : SharedBufferStrategy(uuid, -1, 0, 0, 0)
+    explicit SharedBufferWatcherStrategy(const std::string& uuid, size_t partitionCount)
+        : SharedBufferStrategy(uuid, -1, 0, 0, 0, 0, partitionCount)
     {
     }
     Status Setup() override
@@ -534,19 +621,39 @@ public:
             return s;
         }
         nNode_ = header->nNode;
+        totalNodeCount_ = nNode_ * partitionCount_;
         shmFile.MUnmap(addr, size);
         totalSize_ = DataOffset();
         s = MmapShmFile(shmFile, totalSize_, addrress_, false);
         if (s.Failure()) [[unlikely]] { return s; }
-        header_ = static_cast<BufferHeader*>(addrress_);
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
-                                                            AccessedOffset());
+        SelectPartition(0);
         return Status::OK();
     }
     void* DataAt(size_t iNode) override { return nullptr; }
     void* DeviceDataAt(size_t iNode) override { return nullptr; }
     void MarkAccessed(size_t /*iNode*/) override {}
+    bool MultiPartitionWatcher() const override { return partitionCount_ > 1; }
+    bool ExistInAllPartitions(const Detail::BlockId& blockId, size_t shardIdx) override
+    {
+        const auto bucket = Hash(blockId, shardIdx);
+        for (size_t partition = 0; partition < partitionCount_; ++partition) {
+            auto* region = static_cast<std::byte*>(addrress_) + partition * MetaRegionSize();
+            auto* header = reinterpret_cast<BufferHeader*>(region);
+            auto* meta = reinterpret_cast<BufferMetaNode*>(region + MetaOffset());
+            header->bucketLocks[bucket].Lock();
+            auto node = header->buckets[bucket];
+            while (node != invalidIndex) {
+                auto* current = meta + node;
+                if (current->block == blockId && current->shard == shardIdx) {
+                    header->bucketLocks[bucket].Unlock();
+                    return true;
+                }
+                node = current->next;
+            }
+            header->bucketLocks[bucket].Unlock();
+        }
+        return false;
+    }
 };
 
 Status TransBuffer::Setup(const Config& config)
@@ -560,14 +667,21 @@ Status TransBuffer::Setup(const Config& config)
         } else if (config.deviceId >= 0) {
             strategy_ = std::make_shared<SharedBufferStrategy>(
                 config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
-                config.loadExclusiveBufferNumber);
+                config.loadExclusiveBufferNumber, config.partitionId, config.partitionCount,
+                config.numaId, config.deferShmRegistration);
         } else {
-            strategy_ = std::make_shared<SharedBufferWatcherStrategy>(config.uniqueId);
+            strategy_ = std::make_shared<SharedBufferWatcherStrategy>(config.uniqueId,
+                                                                       config.partitionCount);
         }
     } catch (const std::exception& e) {
         return Status::Error(fmt::format("failed({}) to make buffer strategy", e.what()));
     }
     return strategy_->Setup();
+}
+
+Status TransBuffer::FinalizeMemoryRegistration()
+{
+    return strategy_->FinalizeMemoryRegistration();
 }
 
 TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
@@ -600,6 +714,9 @@ void TransBuffer::Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool
 
 bool TransBuffer::Exist(const Detail::BlockId& blockId, size_t shardIdx)
 {
+    if (strategy_->MultiPartitionWatcher()) {
+        return strategy_->ExistInAllPartitions(blockId, shardIdx);
+    }
     auto iBucket = Hash(blockId, shardIdx);
     strategy_->BucketLock(iBucket);
     auto exist = ExistAt(iBucket, blockId, shardIdx);

@@ -178,6 +178,13 @@ public:
         }
     }
     uintptr_t Self() const { return (uintptr_t)(void*)StoreBack(); }
+    void FinalizeMemoryRegistration()
+    {
+        for (const auto& store : stores_) {
+            auto* registration = dynamic_cast<MemoryRegistration*>(store.get());
+            if (registration) { ThrowIfFailed(registration->FinalizeMemoryRegistration()); }
+        }
+    }
     pybind11::bytes Lookup(const pybind11::buffer& ids)
     {
         BufferArrayView<Detail::BlockId> idArr{ids};
@@ -212,6 +219,25 @@ public:
     {
         auto desc = MakeTaskDesc(ids, indexes, addrs);
         desc.brief = "Load";
+        auto res = StoreBack()->Load(std::move(desc));
+        if (res) { return res.Value(); }
+        ThrowError(res.Error());
+    }
+    Detail::TaskHandle LoadD2D(const pybind11::buffer& ids, const pybind11::buffer& indexes,
+                               const pybind11::buffer& addrs,
+                               const pybind11::buffer& peerAddrs, size_t numPeers)
+    {
+        auto desc = MakeTaskDesc(ids, indexes, addrs);
+        BufferArrayView<void*> peers{peerAddrs};
+        const auto tensorsPerShard = desc.empty() ? 0 : desc.front().addrs.size();
+        const auto expected = numPeers * desc.size() * tensorsPerShard;
+        if (peers.num != expected) {
+            ThrowIfFailed(Status::InvalidParam("invalid D2D addresses: {}, expected {}",
+                                               peers.num, expected));
+        }
+        desc.brief = "LoadD2D";
+        desc.d2dPeerAddrs.assign(peers.data, peers.data + peers.num);
+        desc.d2dNumPeers = numPeers;
         auto res = StoreBack()->Load(std::move(desc));
         if (res) { return res.Value(); }
         ThrowError(res.Error());
@@ -264,12 +290,16 @@ PYBIND11_MODULE(ucmpipelinestore, m)
     s.def(py::init<>());
     s.def("Stack", &PipelineStore::Stack);
     s.def("Self", &PipelineStore::Self);
+    s.def("FinalizeMemoryRegistration", &PipelineStore::FinalizeMemoryRegistration);
     s.def("Lookup", &PipelineStore::Lookup, py::arg("ids").noconvert());
     s.def("LookupOnPrefix", &PipelineStore::LookupOnPrefix, py::arg("ids").noconvert());
     s.def("LookupOnReverse", &PipelineStore::LookupOnReverse, py::arg("ids").noconvert());
     s.def("Prefetch", &PipelineStore::Prefetch, py::arg("ids").noconvert());
     s.def("Load", &PipelineStore::Load, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
           py::arg("addrs").noconvert());
+        s.def("LoadD2D", &PipelineStore::LoadD2D, py::arg("ids").noconvert(),
+            py::arg("indexes").noconvert(), py::arg("addrs").noconvert(),
+            py::arg("peer_addrs").noconvert(), py::arg("num_peers"));
     s.def("Dump", &PipelineStore::Dump, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
           py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0);
     s.def("Check", &PipelineStore::Check);
