@@ -152,7 +152,10 @@ class TraceReplayDataset(BenchmarkDataset):
         **kwargs,
     ) -> dict[float, list[SampleRequest]]:
         requests = defaultdict(list)
-        # If exists prompts file generated before, load prompts from file
+        # If exists prompts file generated before, load prompts from file.
+        # The file is written atomically (tmp + rename), so its existence
+        # implies completeness. A line-count mismatch means it is stale for
+        # the current trace: regenerate instead of replaying a partial set.
         if os.path.exists(self.prompts_file_name):
             with open(self.prompts_file_name, "r", encoding="utf-8") as f:
                 # Read by line
@@ -169,8 +172,16 @@ class TraceReplayDataset(BenchmarkDataset):
                             expected_output_len=output_length,
                         )
                     )
-            print(f"Done load prompts file, time: {time.time()}")
-            return requests
+            expected = sum(len(v) for v in self.REG_GROUPS.values())
+            loaded = sum(len(v) for v in requests.values())
+            if loaded == expected:
+                print(f"Done load prompts file ({loaded} reqs), time: {time.time()}")
+                return requests
+            print(
+                f"Prompts file stale ({loaded} cached vs {expected} in trace), "
+                "regenerating"
+            )
+            requests = defaultdict(list)
 
         assert self.REG_GROUPS is not None, "Find no trace info!!!"
 
@@ -190,7 +201,11 @@ class TraceReplayDataset(BenchmarkDataset):
                 )
         if not save_prompts:
             return requests
-        with open(self.prompts_file_name, "a", encoding="utf-8") as f:
+        # Atomic write (tmp + rename): a killed run leaves either the old
+        # file or the new complete one, never a partial mix. This is what
+        # lets the prompts cache be reused without the replay succeeding.
+        tmp_name = self.prompts_file_name + ".tmp"
+        with open(tmp_name, "w", encoding="utf-8") as f:
             for timestamp, reqs_list in requests.items():
                 for req in reqs_list:
                     data = {
@@ -200,6 +215,7 @@ class TraceReplayDataset(BenchmarkDataset):
                         "output_length": req.expected_output_len,
                     }
                     f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        os.replace(tmp_name, self.prompts_file_name)
 
         print(f"Done sample, time: {time.time()}")
         return requests
@@ -421,28 +437,31 @@ def save_req_results_to_file(outputs, output_dir="./"):
             "ttfts_ms": ttft,
             "tpot_ms": tpot,
         }
-        if output.send_time and output.running_time:
-            row["send_to_funning"] = output.running_time - output.send_time
-        if output.running_time and output.worker_time:
-            row["running_to_worker"] = output.worker_time - output.running_time
-        if output.worker_time and output.start_loadkv_time:
-            row["worker_to_loadkv"] = output.start_loadkv_time - output.worker_time
-        if output.start_loadkv_time and output.start_forward_time:
-            row["loadkv_duration"] = (
-                output.start_forward_time - output.start_loadkv_time
-            )
-        if output.start_forward_time and output.finish_forward_time:
-            row["forward_duration"] = (
-                output.finish_forward_time - output.start_forward_time
-            )
-        if output.finish_forward_time and output.finish_savekv_time:
-            row["savekv_duration"] = (
-                output.finish_savekv_time - output.finish_forward_time
-            )
-        if output.first_token_time and output.running_time:
-            row["running_to_first_token"] = (
-                output.first_token_time - output.running_time
-            )
+        # UCM-fork-only timeline fields: plain vllm's RequestFuncOutput does not
+        # define them at all, so fall back to None instead of crashing the
+        # per-request export (columns are simply omitted in that case).
+        send_time = getattr(output, "send_time", None)
+        running_time = getattr(output, "running_time", None)
+        worker_time = getattr(output, "worker_time", None)
+        start_loadkv_time = getattr(output, "start_loadkv_time", None)
+        start_forward_time = getattr(output, "start_forward_time", None)
+        finish_forward_time = getattr(output, "finish_forward_time", None)
+        finish_savekv_time = getattr(output, "finish_savekv_time", None)
+        first_token_time = getattr(output, "first_token_time", None)
+        if send_time and running_time:
+            row["send_to_funning"] = running_time - send_time
+        if running_time and worker_time:
+            row["running_to_worker"] = worker_time - running_time
+        if worker_time and start_loadkv_time:
+            row["worker_to_loadkv"] = start_loadkv_time - worker_time
+        if start_loadkv_time and start_forward_time:
+            row["loadkv_duration"] = start_forward_time - start_loadkv_time
+        if start_forward_time and finish_forward_time:
+            row["forward_duration"] = finish_forward_time - start_forward_time
+        if finish_forward_time and finish_savekv_time:
+            row["savekv_duration"] = finish_savekv_time - finish_forward_time
+        if first_token_time and running_time:
+            row["running_to_first_token"] = first_token_time - running_time
         row["success"] = output.success
         rows.append(row)
 
