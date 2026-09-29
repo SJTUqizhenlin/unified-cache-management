@@ -333,8 +333,7 @@ PY
 fi
 
 # ---------------- 全部测试完成，可选停止 server ----------------
-# 注意：压测失败也不会跳过此处（上方 if 包裹不触发 set -e）；
-#       server 由 --stop-server 统一清理，结果是否采信看终端 Benchmark Result 判定
+# 注意：仅在成功路径执行（set -e 下若 trace_replay 失败会直接退出，server 保留便于排查）
 if [[ "$STOP_SERVER" == "1" ]]; then
   stop_server
 fi

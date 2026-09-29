@@ -361,7 +361,26 @@ sudo systemctl stop nvmf-loop
 | `kernel_cache_test` | ucm_cache_simu/ | UCM cache 模拟（POSIX 文件 + .tmp/rename 语义，-e psync/aio）|
 | `cpu_sample.sh` | ucm_cache_simu/ | 测量期 CPU 采样（自动跳过 init-dump）|
 | `ssd_pressure_model.py` | ucm_cache_simu/ | 服务压力模型（N/TTFT/TPOT → RPS → 盘带宽需求）|
-| `nvmf_loop.sh` | testSPDK/ | NVMe-oF RDMA 回环 target 一键启停（start/stop，见第五节）|
+| `nvmf_loop.sh` | testSPDK/ | NVMe-oF RDMA 回环 target 一键启停（start/stop/status，见第五节）|
+| `ucm_spdk_store` | ucm_spdk_store/ | SPDK 版 UCM store 后端原型（M2 完成）：superblock + 固定 1GiB 索引区 +
+  容量可原地扩缩 + epoch 崩溃一致性 + backward-shift 删除 + 共享 SHM 索引（robust 锁）+
+  hotness/pin GC + **reactor 线程模型**（专核 reactor 持 qpair，任意线程经 spdk_ring
+  MP_SC 提交 op，eventfd 等价物为 pthread condvar 唤醒，lookup 不经 reactor 直查 SHM）+
+  reactor_pause/resume（恢复/格式化/跨进程 fork 的直连窗口）+ `-m lookup` 无设备角色 +
+  `-H` 大页前置检查；15 项单元测试；多进程数据面走 nvmf 回环 |
+
+### 模型切换语义（geometry 即运行时模型参数）
+
+store 是容量池：`-L/-K`（= UCM 的 `shard_size/block_size`）是**运行时模型几何**，不是
+盘的固定属性。对已有区域换几何启动时**不再拒绝**，而是自动整库失效并按新几何原地重开：
+
+- 所有旧块视为失效（共享段按几何命名，旧段被清理；字节数容量保留，槽数 = 容量÷新块大小）；
+- 切换要求主机上所有 SPDK store 进程退出（换模型本来就是滚动重启）；
+- 格式化/切换是两段式发布（先写 nslots=0 的"进行中" superblock，清完索引记录再发布有效
+  superblock），中途崩溃由下一次启动自动续完，不会出现半格式化状态；
+- 真正的裸区域首次使用仍需显式 `-F` / `spdk_format`（防误指盘）；`-F` 也可用于同几何下
+  的强制清库。T14 即验证该行为（伪造异几何 superblock → 重解析 → 旧块全灭、计数归零、
+  新模型可正常 dump/load）。
 
 cache 模拟的关键参数：`-n` 块池、`-c` load step、`-M` 写比例、`-W` layerwise、
 `-F` ID 替换率、`-S rand|seq` 定靶、`-e psync|aio`（仅 kernel 侧）、

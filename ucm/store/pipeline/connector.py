@@ -383,6 +383,22 @@ def _dram_pipeline_builder(
 UcmPipelineStoreBuilder.register("Cache|Ds3fs", _cache_ds3fs_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Empty", _cache_empty_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Posix", _cache_posix_pipeline_builder)
+
+
+def _cache_spdk_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+):
+    """Cache|Spdk pipeline: DRAM cache fronting the SPDK raw-NVMe store."""
+    store_dir = Path(__file__).resolve().parent.parent
+    spdk_config = copy.deepcopy(config)
+    if config.get("device_id", -1) >= 0:
+        spdk_config |= {"tensor_size": config["shard_size"]}
+    _preload_metrics(store_dir)
+    pipeline.Stack("Spdk", str(store_dir / "spdk/libspdkstore.so"), spdk_config)
+    pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
+
+
+UcmPipelineStoreBuilder.register("Cache|Spdk", _cache_spdk_pipeline_builder)
 UcmPipelineStoreBuilder.register("Empty", _empty_pipeline_builder)
 UcmPipelineStoreBuilder.register("Fake", _fake_pipeline_builder)
 UcmPipelineStoreBuilder.register("Posix", _posix_pipeline_builder)

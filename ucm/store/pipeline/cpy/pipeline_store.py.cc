@@ -145,8 +145,8 @@ public:
     ~PipelineStore()
     {
         for (auto& healthBreakerStore : healthBreakerStores_) { healthBreakerStore->Stop(); }
-        healthBreakerStores_.clear();
         while (!stores_.empty()) { stores_.pop_back(); }
+        healthBreakerStores_.clear();
     }
     void Stack(const std::string& name, const std::string& path, const py::dict& dict)
     {

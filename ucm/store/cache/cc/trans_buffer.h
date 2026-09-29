@@ -109,6 +109,8 @@ public:
 
 public:
     Status Setup(const Config& config);
+    void* HostData();
+    size_t HostDataSize();
     Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
                bool isLoad = false);
     void Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false);

@@ -71,6 +71,7 @@ source "$HOME/ucm-serve-env.sh"                 # CANN(~/ascend) + conda(vllm-uc
 export ENABLE_UCM_PATCH="$UCM_ENABLED"          # 覆盖 env 文件默认值，支持 --ucm off
 export PLATFORM=ascend
 export ASCEND_ROOT="$HOME/ascend/ascend-toolkit/latest"   # UCM 定位 CANN（宿主机非默认路径）
+export SPDK_ROOT_DIR="${SPDK_ROOT_DIR:-$HOME/devSPDK/spdk}"  # spdkstore 后端定位 SPDK
 export ASCEND_RT_VISIBLE_DEVICES="$DEVICES"
 export UCM_LOG_PATH="$HOME/ucm-logs/$PORT"
 mkdir -p "$UCM_LOG_PATH" "$HOME/ucm-cache"
@@ -164,7 +165,11 @@ if [[ "${SKIP_REBUILD:-0}" == "1" ]]; then
 else
   # 注意：不能用 "| sort -rn | head -1"（head 提前退出 → sort 收到 SIGPIPE(141) → pipefail 杀脚本），
   # 用 awk 一站式取最大值（读完全部输入，无提前退出）
+  # testSPDK/ucm_spdk_store/ucm_spdk_store.c 是 spdkstore 的引擎源码（CMake 直接编译它），
+  # 必须纳入 mtime 检查，否则只改引擎不触发重编 → 源码树 .so 静默过期
   src_t=$( { find "$REPO/ucm" -type f \( -name '*.cc' -o -name '*.h' -o -name '*.cpp' -o -name '*.hpp' -o -name 'CMakeLists.txt' \) -printf '%T@\n' 2>/dev/null || true
+             find "$REPO/testSPDK/ucm_spdk_store" -type f \( -name '*.c' -o -name '*.h' \) -printf '%T@\n' 2>/dev/null || true
+             find "$REPO/ucm/store/spdk" -type f \( -name '*.c' -o -name 'Makefile' -o -name '*.sh' \) -printf '%T@\n' 2>/dev/null || true
              stat -c '%Y' "$REPO/CMakeLists.txt" "$REPO/setup.py" "$REPO/version.ini" 2>/dev/null || true; } | \
            awk '$0+0>m{m=$0+0} END{if(NR>0) printf "%.6f", m}')
   so_t=$(find "$REPO/ucm" -type f -name '*.so' -printf '%T@\n' 2>/dev/null | \

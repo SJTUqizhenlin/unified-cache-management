@@ -137,6 +137,25 @@ public:
     virtual Status CheckHealth() { return Status::OK(); }
 
     /**
+     * Register/unregister a host-memory pool used by an upper store stage.
+     *
+     * Cache|Spdk uses this hook after the Cache stage has mmap'ed its shared
+     * data region.  Posix and other backends keep the no-op default.  The
+     * mapping must remain valid until UnregisterHostMemory returns.
+     */
+    virtual Status RegisterHostMemory(void* addr, size_t size)
+    {
+        (void)addr;
+        (void)size;
+        return Status::OK();
+    }
+    virtual void UnregisterHostMemory(void* addr, size_t size)
+    {
+        (void)addr;
+        (void)size;
+    }
+
+    /**
      * @brief Start an asynchronous load (storage → device) transfer.
      *
      * @param task Description of shards to be loaded.

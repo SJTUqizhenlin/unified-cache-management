@@ -53,6 +53,7 @@ struct Config {
     size_t bufferCapacity{256ULL << 30};
     size_t loadExclusiveBufferNumber{1024};
     bool shareBufferEnable{true};
+    bool shmHugepageAdvise{false};
     size_t waitingQueueDepth{8192};
     size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};

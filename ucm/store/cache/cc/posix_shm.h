@@ -29,6 +29,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "logger/logger.h"
 #include "status/status.h"
 
 namespace UC::CacheStore {
@@ -80,6 +81,18 @@ public:
         auto eno = errno;
         if (addr != MAP_FAILED) { return Status::OK(); }
         return Status{eno, std::to_string(eno)};
+    }
+    /* Ask tmpfs for 2MB pages (requires /dev/shm mounted with huge=advise,
+     * the openEuler default). Advisory only: silently falls back to 4K
+     * pages when no hugepages are free. Needed by backends that DMA
+     * directly into these buffers (SPDK registration granularity). */
+    static Status AdviseHugepage(void* addr, size_t size)
+    {
+        if (madvise(addr, size, MADV_HUGEPAGE) != 0) {
+            auto eno = errno;
+            UC_WARN("madvise(MADV_HUGEPAGE) failed ({}), falling back to 4K pages.", eno);
+        }
+        return Status::OK();
     }
     static void MUnmap(void* addr, size_t size) { munmap(addr, size); }
     void ShmUnlink() { shm_unlink(name_.c_str()); }

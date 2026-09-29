@@ -72,6 +72,7 @@ void HealthBreakerStore::Stop()
         probeThread_.join();
         UC_INFO("Stopped store health breaker({}).", storeId_);
     }
+    if (healthCheck_) { healthCheck_->Stop(); }
 }
 
 size_t HealthBreakerStore::FailureCount() const
@@ -146,6 +147,16 @@ Status HealthBreakerStore::CheckHealth()
     RecordHealth(status.Success());
     RecordProbeMetrics(status.Success());
     return status;
+}
+
+Status HealthBreakerStore::RegisterHostMemory(void* addr, size_t size)
+{
+    return store_->RegisterHostMemory(addr, size);
+}
+
+void HealthBreakerStore::UnregisterHostMemory(void* addr, size_t size)
+{
+    store_->UnregisterHostMemory(addr, size);
 }
 
 Expected<Detail::TaskHandle> HealthBreakerStore::Load(Detail::TaskDesc task)

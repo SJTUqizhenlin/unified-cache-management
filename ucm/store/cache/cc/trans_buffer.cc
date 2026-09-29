@@ -94,6 +94,8 @@ public:
     virtual size_t FetchNode(bool allowReserved) = 0;
     virtual void* DataAt(size_t iNode) = 0;
     virtual void* DeviceDataAt(size_t iNode) = 0;
+    virtual void* HostData() = 0;
+    virtual size_t HostDataSize() const = 0;
     virtual BufferMetaNode* MetaAt(size_t iNode) = 0;
     virtual void MarkAccessed(size_t iNode) = 0;
 };
@@ -246,6 +248,8 @@ public:
         if (dataOnDevice_ == nullptr) { return nullptr; }
         return dataOnDevice_ + header_.nodeSize * iNode;
     }
+    void* HostData() override { return data_.get(); }
+    size_t HostDataSize() const override { return base_.nodeSize * header_.nNode; }
     BufferMetaNode* MetaAt(size_t iNode) override { return meta_.get() + iNode; }
 };
 
@@ -300,6 +304,7 @@ protected:
     size_t nNode_{0};
     void* addrress_{nullptr};
     size_t totalSize_{0};
+    bool hugepageAdvise_{false};
 
     size_t AccessedOffset() const noexcept
     {
@@ -349,8 +354,7 @@ protected:
             }
         }
     }
-    static Status MmapShmFile(PosixShm& shmFile, const size_t size, void*& addr,
-                              bool needTrunc = true)
+    Status MmapShmFile(PosixShm& shmFile, const size_t size, void*& addr, bool needTrunc = true)
     {
         auto s = Status::OK();
         if (needTrunc) {
@@ -360,11 +364,26 @@ protected:
                 return s;
             }
         }
-        s = shmFile.MMap(addr, size, true, true, true, true);
+        s = shmFile.MMap(addr, size, true, true, true, false);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to mmap file({}) with size({}).", s, shmFile.ShmName(), size);
             return s;
         }
+        if (hugepageAdvise_) {
+            PosixShm::AdviseHugepage(addr, size);
+        }
+#ifdef MADV_POPULATE_WRITE
+        if (madvise(addr, size, MADV_POPULATE_WRITE) != 0) {
+            auto eno = errno;
+            UC_WARN("madvise(MADV_POPULATE_WRITE) failed ({}); pages will fault lazily.", eno);
+        }
+#else
+        static const auto pageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        auto* bytes = static_cast<volatile uint8_t*>(addr);
+        for (size_t offset = 0; offset < size; offset += pageSize) {
+            bytes[offset] = bytes[offset];
+        }
+#endif
         return Status::OK();
     }
     static Status WaitShmHeaderReady(BufferHeader* header)
@@ -442,8 +461,10 @@ protected:
 
 public:
     SharedBufferStrategy(const std::string& uuid, int32_t deviceId, size_t nodeSize,
-                         size_t totalSize, size_t reservedNumber)
-        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber), uuid_(uuid)
+                         size_t totalSize, size_t reservedNumber, bool hugepageAdvise)
+        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber),
+          uuid_(uuid),
+          hugepageAdvise_(hugepageAdvise)
     {
     }
     ~SharedBufferStrategy() override
@@ -504,13 +525,15 @@ public:
     }
     void* DataAt(size_t iNode) override { return data_ + nodeSize_ * iNode; }
     void* DeviceDataAt(size_t iNode) override { return dataOnDevice_ + nodeSize_ * iNode; }
+    void* HostData() override { return data_; }
+    size_t HostDataSize() const override { return DataSize(); }
     BufferMetaNode* MetaAt(size_t iNode) override { return meta_ + iNode; }
 };
 
 class SharedBufferWatcherStrategy : public SharedBufferStrategy {
 public:
-    explicit SharedBufferWatcherStrategy(const std::string& uuid)
-        : SharedBufferStrategy(uuid, -1, 0, 0, 0)
+    SharedBufferWatcherStrategy(const std::string& uuid, bool hugepageAdvise)
+        : SharedBufferStrategy(uuid, -1, 0, 0, 0, hugepageAdvise)
     {
     }
     Status Setup() override
@@ -546,6 +569,8 @@ public:
     }
     void* DataAt(size_t iNode) override { return nullptr; }
     void* DeviceDataAt(size_t iNode) override { return nullptr; }
+    void* HostData() override { return nullptr; }
+    size_t HostDataSize() const override { return 0; }
     void MarkAccessed(size_t /*iNode*/) override {}
 };
 
@@ -560,14 +585,25 @@ Status TransBuffer::Setup(const Config& config)
         } else if (config.deviceId >= 0) {
             strategy_ = std::make_shared<SharedBufferStrategy>(
                 config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
-                config.loadExclusiveBufferNumber);
+                config.loadExclusiveBufferNumber, config.shmHugepageAdvise);
         } else {
-            strategy_ = std::make_shared<SharedBufferWatcherStrategy>(config.uniqueId);
+            strategy_ = std::make_shared<SharedBufferWatcherStrategy>(config.uniqueId,
+                                                                      config.shmHugepageAdvise);
         }
     } catch (const std::exception& e) {
         return Status::Error(fmt::format("failed({}) to make buffer strategy", e.what()));
     }
     return strategy_->Setup();
+}
+
+void* TransBuffer::HostData()
+{
+    return strategy_ ? strategy_->HostData() : nullptr;
+}
+
+size_t TransBuffer::HostDataSize()
+{
+    return strategy_ ? strategy_->HostDataSize() : 0;
 }
 
 TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,

@@ -40,7 +40,22 @@
 namespace UC::CacheStore {
 
 class CacheStore : public StoreV1 {
+    struct BackendMemoryRegistration {
+        StoreV1* backend{nullptr};
+        void* addr{nullptr};
+        size_t size{0};
+        ~BackendMemoryRegistration()
+        {
+            if (backend && addr) { backend->UnregisterHostMemory(addr, size); }
+        }
+    };
+
+    /* Destruction is reverse declaration order:
+     * transMgr_ stops first, then backend memory is unregistered, then
+     * bufferMgr_ unmaps the SHM region. */
     BufferManager bufferMgr_;
+    BackendMemoryRegistration backendMemory_;
+    StoreV1* backend_{nullptr};
     bool transEnable_{false};
     TransManager transMgr_;
     std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_{nullptr};
@@ -49,6 +64,7 @@ public:
     Status Setup(const Detail::Dictionary& inConfig) override
     {
         auto config = ParseConfig(inConfig);
+        backend_ = config.storeBackend;
         auto s = CheckConfig(config);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed to check config params: {}.", s);
@@ -67,6 +83,19 @@ public:
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to setup buffer manager.", s);
             return s;
+        }
+        auto* hostData = bufferMgr_.HostData();
+        auto hostSize = bufferMgr_.HostDataSize();
+        if (backend_ && hostData && hostSize > 0) {
+            s = backend_->RegisterHostMemory(hostData, hostSize);
+            if (s.Failure()) [[unlikely]] {
+                UC_ERROR("Failed({}) to register Cache SHM ({}, {} bytes) in backend {}.",
+                         s, hostData, hostSize, backend_->Readme());
+                return s;
+            }
+            backendMemory_.backend = backend_;
+            backendMemory_.addr = hostData;
+            backendMemory_.size = hostSize;
         }
         transEnable_ = config.deviceId >= 0;
         if (transEnable_) {
@@ -152,6 +181,7 @@ private:
         config.Get("cpu_affinity_cores", param.cpuAffinityCores);
         if (param.shardSize > 0) { param.waitingQueueDepth *= (param.blockSize / param.shardSize); }
         config.Get("share_buffer_enable", param.shareBufferEnable);
+        config.Get("shm_hugepage_advise", param.shmHugepageAdvise);
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);
         size_t bufferCapacityGb = 0;

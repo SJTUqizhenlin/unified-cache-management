@@ -2,3 +2,4 @@ include CMakeLists.txt
 graft ucm
 graft examples
 graft benchmarks
+include testSPDK/ucm_spdk_store/ucm_spdk_store.c

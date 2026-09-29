@@ -57,6 +57,8 @@ public:
     Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override;
     void Prefetch(const Detail::BlockId* blocks, size_t num) override;
     Status CheckHealth() override;
+    Status RegisterHostMemory(void* addr, size_t size) override;
+    void UnregisterHostMemory(void* addr, size_t size) override;
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override;
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override;
     Expected<bool> Check(Detail::TaskHandle taskId) override;
