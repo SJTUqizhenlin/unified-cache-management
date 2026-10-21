@@ -9,6 +9,9 @@
 int store_engine_init(const char *trid_str, uint32_t nslots_req,
 		      uint32_t layers, uint32_t shard_kb, uint64_t offset_gib,
 		      int format);
+int store_engine_init_for_session(const char *trid_str, uint32_t nslots_req,
+		      uint32_t layers, uint32_t shard_kb, uint64_t offset_gib,
+		      int format, const char *session);
 void store_engine_fini(void);
 int store_lookup_init(void);
 int store_lookup_init_region(const char *trid_str, uint64_t offset_gib);
@@ -22,6 +25,8 @@ int store_load_submit(const uint8_t id[16], uint32_t first, uint32_t count,
 		      void (*cb)(void *, int), void *arg);
 int store_delete(const uint8_t id[16], void (*cb)(void *, int), void *arg);
 int store_gc_public(int max_victims);
+int store_gc_start(double threshold, double recycle, uint32_t interval);
+void store_gc_stop(void);
 void store_set_direct_dma(int enable);
 uint64_t store_registered_bytes(void);
 int store_register_memory(void *addr, uint64_t size);
@@ -51,6 +56,14 @@ void
 spdk_store_fini(void)
 {
 	store_engine_fini();
+}
+
+int
+spdk_store_init_for_session(const char *trid_str, uint32_t nslots, uint32_t layers,
+		uint32_t shard_kb, uint64_t offset_gib, int format, const char *session)
+{
+	return store_engine_init_for_session(trid_str, nslots, layers, shard_kb,
+					    offset_gib, format, session);
 }
 
 int
@@ -126,6 +139,18 @@ int
 spdk_store_gc(int max_victims)
 {
 	return store_gc_public(max_victims);
+}
+
+int
+spdk_store_gc_start(double threshold, double recycle, uint32_t interval)
+{
+	return store_gc_start(threshold, recycle, interval);
+}
+
+void
+spdk_store_gc_stop(void)
+{
+	store_gc_stop();
 }
 
 uint64_t

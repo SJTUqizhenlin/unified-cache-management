@@ -29,4 +29,11 @@ if(BUILD_UNIT_TESTS)
     endif()
     target_link_libraries(ucmstore.test PRIVATE delegator delegator_store)
     gtest_discover_tests(ucmstore.test)
+
+    # Compile the real adapter against a fake engine, never the NVMe engine.
+    add_executable(spdkstore.test spdk/spdk_store_setup_test.cc spdk/startup_lock_test.cc
+        spdk/gc_policy_test.cc)
+    target_include_directories(spdkstore.test PRIVATE ${UCM_ROOT_DIR})
+    target_link_libraries(spdkstore.test PRIVATE storeintf infra_logger metrics gtest_main gtest)
+    gtest_discover_tests(spdkstore.test)
 endif()

@@ -6,6 +6,37 @@
 
 ---
 
+## Periodic SPDK GC
+
+Worker configuration keys: `spdk_gc_enable` (bool, default `true`),
+`spdk_gc_trigger_threshold_ratio` (double, default `0.7`),
+`spdk_gc_recycle_percent` (double, default `0.1`), and
+`spdk_gc_check_interval_sec` (positive integer, default `30`). Ratios must
+be finite and in `(0, 1]`; invalid worker configuration fails before device init.
+Schedulers remain lookup-only and never start GC or initialize a device.
+
+A separate timer thread requests an initial check and subsequent periodic checks.
+Only the reactor scans the index or submits invalidations. At or above the
+threshold, each round selects `floor(live_blocks * recycle_percent)` cold blocks,
+matching Posix's live-count fraction, and repeats until below threshold. Rounds
+use batches of at most 16 with invalidation backpressure. A round that rounds
+down to zero, or cannot find unpinned victims, ends the cycle until the next check.
+The existing four-victim ENOSPC fallback remains independent of periodic GC.
+
+Selection and visibility removal share the robust SHM mutex with load/overwrite
+pin acquisition. Pinned slots are excluded; slots become reusable only after
+durable invalidation and pin retirement. A region-scoped SHM `flock` gate is held
+through the whole cycle and invalidation drain, preventing TP workers from each
+reclaiming a fraction concurrently. The kernel releases ownership on process
+exit; do not unlink live gate objects. Crash recovery still rebuilds the index.
+GC stops before host-memory unregister and reactor teardown. Stop wakes the timer
+immediately, then waits for the reactor's current invalidations to drain; device
+failure handling uses the existing engine watchdog, not a separate GC timeout.
+
+Hardware-free checks: build `spdkstore.test` and `spdkstore`, then run
+`ctest --test-dir /tmp/opencode/ucm-spdk-role-build -R '^Spdk' --output-on-failure`.
+These tests do not probe, format, or write an NVMe device.
+
 ## 一、RDMA 重编流程（`--with-rdma`）
 
 首次构建时未开 RDMA（`CONFIG_RDMA=n`），导致 `libspdk_nvme.a` 不含
@@ -352,6 +383,28 @@ sudo systemctl stop nvmf-loop
 ---
 
 ## 六、本仓库工具索引（本目录 `testSPDK/`，已迁入 UCM 仓库；SPDK 源码仍在 `/home/qizhenlin/devSPDK/spdk`）
+
+### SPDK Store Serving Startup
+
+For `Cache|Spdk`, `spdk_format: 0` preserves the existing region by default.
+Set `spdk_format: 1` to invalidate all stored KV blocks once on each new
+service startup, including first-use initialization. This is a startup option,
+not an online reset of a running service; changing YAML requires a restart.
+
+All workers use UCM's shared per-startup `unique_id`. The first worker takes
+exclusive maintenance access, rewrites the superblock/index and rebuilds the
+shared index. After successful engine startup it records the service ID;
+subsequent workers with the same ID validate geometry/capacity and join without
+formatting again. The scheduler remains lookup-only and never formats.
+An incompatible geometry/capacity within the same startup is rejected.
+Any previous store users must exit before formatting; the NVMe-oF target may
+remain running. A different service cannot clear a pool while old users hold
+its protection leases. No raw data-area erase or SSD secure erase is performed.
+
+Leaving `spdk_format: 1` in YAML clears the region again on the next fresh
+service startup. Use `0` for warm-store benchmarks. `KEEP_CACHE` controls only
+the launcher's filesystem cache cleanup, not SPDK formatting. Direct users of
+`UcmPipelineStore` must provide a shared, fresh `unique_id` for formatting.
 
 | 工具 | 目录 | 说明 |
 |---|---|---|

@@ -25,7 +25,7 @@
 UCM_ENABLED=1
 CACHE_DIR="${CACHE_DIR:-$HOME/ucm-cache/test}"
 MODEL="${MODEL:-/mnt/model/DeepSeek-V2-Lite-Chat}"
-DEVICES="${DEVICES:-0,1,2,3}"
+DEVICES="${DEVICES:-4,5,6,7}"
 PORT="${PORT:-7780}"
 REPO="$HOME/devA2/unified-cache-management"
 # 配置文件放在缓存目录外（避免被清空逻辑误删），按缓存目录名隔离
@@ -75,6 +75,12 @@ export SPDK_ROOT_DIR="${SPDK_ROOT_DIR:-$HOME/devSPDK/spdk}"  # spdkstore 后端�
 export ASCEND_RT_VISIBLE_DEVICES="$DEVICES"
 export UCM_LOG_PATH="$HOME/ucm-logs/$PORT"
 mkdir -p "$UCM_LOG_PATH" "$HOME/ucm-cache"
+# Preserve native SPDK/CANN stderr as well as Python logs for crash diagnosis.
+SERVER_LOG="$UCM_LOG_PATH/server_$(date +%Y%m%d_%H%M%S)_$$.log"
+exec > >(tee -a "$SERVER_LOG") 2>&1
+export PYTHONFAULTHANDLER=1
+export PYTHONUNBUFFERED=1
+echo "==> 完整 server stdout/stderr: $SERVER_LOG"
 cd "$REPO"
 
 set -euo pipefail
@@ -139,23 +145,10 @@ ls /dev/shm/uc_shm_cache* >/dev/null 2>&1 || echo "    ✓ /dev/shm 无 uc_shm_c
 
 # c) 所选 NPU 的 HBM 基线检查（基线约 3.4GB；>8GB 视为被占用 → 本实例必然启动失败，提前报错）
 #    注：npu-smi 表格中每张卡两行 —— 第一行含 NPU 编号，第二行（含 Bus-Id）才有 HBM
-NPU_BLOCKED=$(npu-smi info 2>/dev/null | tr -s ' ' | awk -F'|' -v devs=",$DEVICES," '
-  $3 ~ /:[0-9a-f]+\./ && $2 ~ /^[ ]*[0-9]+[ ]*$/ {
-    if (index(devs, "," npu ",") > 0) {
-      s = $0; last = ""
-      while (match(s, /[0-9]+ \/ [0-9]+/)) { last = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH) }
-      split(last, u, " / ")
-      if (u[1] + 0 > 8000) printf "    NPU %d HBM 已用 %s MB", npu, u[1]
-    }
-  }
-  $2 ~ /^[ ]*[0-9]+[ ]+[^ ]/ { npu = $2 + 0 }') || NPU_BLOCKED=""
-if [[ -n "$NPU_BLOCKED" ]]; then
-  echo "ERROR: 所选设备中存在 HBM 占用（可能是他人任务或未清理干净）：" >&2
-  echo "$NPU_BLOCKED" >&2
-  echo "       请调整 DEVICES 环境变量换卡，或等待占用释放后再启动" >&2
+if ! npu-smi info | python "$REPO/scripts/check_npu_hbm.py" --devices "$DEVICES"; then
+  echo "ERROR: NPU 占用预检未通过；请确认 npu-smi 输出、设备编号或等待占用释放" >&2
   exit 1
 fi
-echo "    ✓ 所选 NPU（$DEVICES）HBM 均为基线水平"
 
 echo "==> [2/6] UCM 构建新旧检查（源码 mtime vs 编译产物 .so）"
 # 规则：C++/构建文件的时间戳新于最新 .so → 需要重编（覆盖 unstaged 编辑 / pull / 切分支三种情况）
@@ -255,6 +248,24 @@ if [[ "$UCM_ENABLED" == "1" ]]; then
   if ! grep -q "storage_backends" "$UCM_CONFIG"; then
     echo "ERROR: $UCM_CONFIG 缺少 storage_backends 字段" >&2
     exit 1
+  fi
+
+  # The local NVMe-oF target must be ready before SPDK workers initialize.
+  SPDK_ENABLED=$(python - "$UCM_CONFIG" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    config = yaml.safe_load(f)
+print(int(any(
+    "spdk" in entry.get("ucm_connector_config", {}).get("store_pipeline", "").lower().split("|")
+    for entry in config.get("ucm_connectors", [])
+)))
+PY
+  )
+  if [[ "$SPDK_ENABLED" == "1" ]]; then
+    echo "==> SPDK 配置：确保本机 nvmf-loop target 已启动"
+    sudo "$REPO/testSPDK/nvmf_loop.sh" start
   fi
 
   UCM_ARGS=(

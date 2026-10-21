@@ -31,11 +31,10 @@ contract of the SPDK store:
     block_size) exactly as the vLLM connector injects it at runtime
     (ucm_connector.py: tensor_size_list/shard_size/block_size are computed
     from the model's kv_cache_layout, never written in the yaml);
-  * the SCHEDULER config has NO geometry and NO device_id — the same keys
-    the yaml holds — and must still serve lookups: the Cache stage exempts
-    deviceId == -1 from size checks and the SPDK store attaches the
-    region-scoped shared index in lookup-only mode without probing the
-    device.
+  * the DP0 SCHEDULER config carries block_size for GC, but has no
+    shard_size or device_id. It must still serve lookups: the Cache and
+    SPDK stages use the default deviceId == -1 for scheduler mode, and
+    SPDK attaches the shared index without probing the device.
 
 A geometry change on the region is a model switch: existing blocks are
 invalidated in place (run 2 uses a different shard size on purpose).
@@ -124,8 +123,11 @@ def run_once(tag, tensor_size, layer_size, chunk_size, request_size):
         "shard_size": chunk_block_size,
         "block_size": chunk_block_size,
     }
-    # The scheduler gets the yaml keys only (no device_id, no geometry).
-    scheduler_cfg = dict(yaml_like)
+    # The DP0 scheduler also gets block_size for GC, but no device_id/shard_size.
+    scheduler_cfg = yaml_like | {
+        "block_size": chunk_block_size,
+        "posix_gc_enable": True,
+    }
 
     worker = UcmPipelineStore(worker_cfg)
     scheduler = UcmPipelineStore(scheduler_cfg)

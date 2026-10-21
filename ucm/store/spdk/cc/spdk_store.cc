@@ -41,7 +41,7 @@
  *                         "trtype:RDMA adrfam:IPv4 traddr:IP trsvcid:4420"
  *   spdk_capacity_gb     active capacity in GiB (default 500; fixes the
  *                        slot count only at first format)
- *   spdk_format          1 = format on first use (default 0)
+ *   spdk_format          1 = clear metadata once per service startup (default 0)
  *   spdk_offset_gib      LBA offset of the pool region (default 0)
  *   shard_size/block_size  runtime model geometry (the same keys the
  *                        Cache stage consumes). The store serves whatever
@@ -56,6 +56,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -193,6 +194,7 @@ public:
     ~SpdkStore() override
     {
         if (initialized_) {
+            if (!lookupOnly_) { spdk_store_gc_stop(); }
             if (registeredHost_) {
                 spdk_store_unregister_memory(registeredHost_, registeredHostSize_);
                 registeredHost_ = nullptr;
@@ -227,15 +229,14 @@ public:
         uint64_t shardSize = 0;
         config.GetNumber("shard_size", shardSize);
 
-        /* No model geometry in the config = scheduler role: the Cache
-         * stage exempts deviceId == -1 from all size checks and the
-         * vLLM connector injects tensor_size_list/shard_size/block_size
-         * only on workers. Attach the shared index without ever probing
-         * the device — the segment is region-scoped (trid + offset), so
-         * no geometry is needed to find it. The worker may still be
-         * creating it (the Cache|Posix watcher waits the same way), so
-         * poll briefly instead of failing instantly. */
-        if (shardSize == 0 && blockSize == 0) {
+        int deviceId = -1;
+        config.GetNumber("device_id", deviceId);
+
+        /* Match the Cache stage's role convention. The DP0 scheduler may
+         * carry block_size for GC, but has no device_id or shard geometry.
+         * Attach its region-scoped index without probing the device; the
+         * worker may still be creating the shared segment. */
+        if (deviceId < 0) {
             int rc = -ENOENT;
             for (int i = 0; i < 100; i++) {
                 rc = spdk_store_lookup_init_region(trid.c_str(), offsetGib);
@@ -249,7 +250,7 @@ public:
             }
             lookupOnly_ = true;
             initialized_ = true;
-            UC_INFO("{}: no model geometry (scheduler role), attached shared "
+            UC_INFO("{}: scheduler role, attached shared "
                     "index in lookup-only mode",
                     kStoreName);
             return Status::OK();
@@ -271,8 +272,31 @@ public:
         config.GetNumber("spdk_capacity_gb", capacityGb);
         if (capacityGb == 0) { capacityGb = 500; }
 
+        bool gcEnable = true;
+        double gcThreshold = 0.7;
+        double gcRecycle = 0.1;
+        int64_t gcInterval = 30;
+        try {
+            config.Get("spdk_gc_enable", gcEnable);
+            config.Get("spdk_gc_trigger_threshold_ratio", gcThreshold);
+            config.Get("spdk_gc_recycle_percent", gcRecycle);
+            config.GetNumber("spdk_gc_check_interval_sec", gcInterval);
+        } catch (const std::bad_any_cast &) {
+            return Status::InvalidParam("invalid SPDK GC config type");
+        }
+        if (!std::isfinite(gcThreshold) || gcThreshold <= 0 || gcThreshold > 1 ||
+            !std::isfinite(gcRecycle) || gcRecycle <= 0 || gcRecycle > 1 ||
+            gcInterval <= 0 || gcInterval > std::numeric_limits<uint32_t>::max()) {
+            return Status::InvalidParam("invalid SPDK GC ratio or check interval");
+        }
+
         int format = 0;
         config.GetNumber("spdk_format", format);
+        std::string session;
+        config.Get("unique_id", session);
+        if (format && session.empty()) {
+            return Status::InvalidParam("spdk_format requires the shared service unique_id");
+        }
 
         /* capacity in slots */
         uint64_t slotBytes = nshards * shardKb * 1024;
@@ -288,24 +312,14 @@ public:
         UC_INFO("{}: trid='{}' capacity={}GB ({} slots) shard={}KB x {}",
                 kStoreName, trid, capacityGb, nslots, shardKb, nshards);
 
-        int rc = spdk_store_init(trid.c_str(), static_cast<uint32_t>(nslots),
+        int rc = format ? spdk_store_init_for_session(
+                                 trid.c_str(), static_cast<uint32_t>(nslots),
+                                 static_cast<uint32_t>(nshards),
+                                 static_cast<uint32_t>(shardKb), offsetGib, format, session.c_str())
+                        : spdk_store_init(trid.c_str(), static_cast<uint32_t>(nslots),
                                  static_cast<uint32_t>(nshards),
                                  static_cast<uint32_t>(shardKb), offsetGib, format);
         if (rc != 0) {
-            if (rc == -ENODEV) {
-                /* device busy or absent: degrade to lookup-only (no
-                 * device access needed) */
-                rc = spdk_store_lookup_init_region(trid.c_str(), offsetGib);
-                if (rc != 0) {
-                    return Status::Error(
-                        fmt::format("lookup-only SHM attach failed: {}", rc));
-                }
-                lookupOnly_ = true;
-                UC_INFO("{}: device unavailable, running in lookup-only mode",
-                        kStoreName);
-                initialized_ = true;
-                return Status::OK();
-            }
             return Status::Error(fmt::format("spdk_store_init failed: {}", rc));
         }
 
@@ -313,6 +327,21 @@ public:
         if (rc != 0) {
             spdk_store_fini();
             return Status::Error(fmt::format("reactor start failed: {}", rc));
+        }
+
+        if (gcEnable) {
+            rc = spdk_store_gc_start(gcThreshold, gcRecycle, static_cast<uint32_t>(gcInterval));
+            if (rc != 0) {
+                spdk_store_gc_stop();
+                spdk_store_reactor_stop();
+                spdk_store_fini();
+                return Status::Error(fmt::format("GC start failed: {}", rc));
+            }
+            UC_INFO("{}: periodic GC started threshold={} recycle={} interval={}s; "
+                    "cycle logs are written to SPDK stderr", kStoreName,
+                    gcThreshold, gcRecycle, gcInterval);
+        } else {
+            UC_INFO("{}: periodic GC disabled (ENOSPC fallback remains enabled)", kStoreName);
         }
 
         initialized_ = true;
@@ -401,6 +430,7 @@ public:
     void UnregisterHostMemory(void* addr, size_t size) override
     {
         if (lookupOnly_ || addr == nullptr || size == 0) { return; }
+        spdk_store_gc_stop();
         auto rc = spdk_store_unregister_memory(addr, size);
         if (rc != 0) {
             UC_ERROR("{}: spdk_mem_unregister({}, {}) failed: {}",

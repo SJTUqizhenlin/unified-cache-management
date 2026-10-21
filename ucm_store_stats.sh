@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ucm_store_stats.sh — UCM posix store 三层运行时统计提取（server/client 运行中随时可用）
+# ucm_store_stats.sh — UCM Posix / SPDK 运行时统计（server/client 运行中随时可用）
 #
 # 三层数据源：
 #   [逻辑层] vllm /metrics 的 ucm:* 系列（读写字节、block 数、命中率、任务平均时长/带宽、
@@ -16,6 +16,11 @@
 #
 # 环境变量覆盖：
 #   HOST=127.0.0.1  PORT=7780  CACHE_DIR=~/ucm-cache/test
+#   STORE_BACKEND=auto|posix|spdk  UCM_CONFIG=/path/to/config.yaml
+#   SPDK_RPC=/path/to/rpc.py  SPDK_RPC_SOCKET=/var/tmp/spdk.sock
+#   SPDK_BDEV=Nvme0n1  SPDK_RPC_SUDO=1 (default; noninteractive sudo)
+#   SPDK probe uses read-only RPC deltas, not strace. No counters are reset.
+#   SPDK: files/syscalls and unexported Store capacity/GC/health are N/A.
 #
 # 提示：metrics 为累计值；窗口分析用 watch 模式（自动做差分）。
 #       指标在有推理请求时才被 vllm 同步到 /metrics，空闲期数值不动是正常现象。
@@ -91,7 +96,7 @@ mrank() {
 METRICS=$(mktemp /tmp/ucm_stats_metrics.XXXXXX)
 trap 'rm -f "$METRICS"' EXIT
 fetch_metrics() {
-  if ! curl -s --max-time 5 "$URL" -o "$METRICS" 2>/dev/null || [[ ! -s "$METRICS" ]]; then
+  if ! curl -fsS --max-time 5 "$URL" -o "$METRICS" 2>/dev/null || [[ ! -s "$METRICS" ]]; then
     return 1
   fi
   grep -q "^ucm:" "$METRICS" || return 1
@@ -157,15 +162,15 @@ collect() {
 declare -a PIDS=()
 discover_pids() {
   local master="" p cl
+  MASTER_PID=""
+  PIDS=()
+  [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || return 0
   for p in $(pgrep -f "vllm serve" 2>/dev/null); do
+    [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == "vllm" ]] || continue
     cl=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
     if [[ "$cl" == *"--port $PORT"* ]]; then master=$p; break; fi
   done
-  if [[ -z "$master" ]]; then
-    master=$(pgrep -f "vllm serve" 2>/dev/null | sed -n '1p')
-  fi
-  PIDS=()
-  [[ -z "$master" ]] && return
+  [[ -z "$master" ]] && return 0
   # BFS 收集子孙进程（最多 4 层）
   local -a queue=("$master") visited=("$master")
   local depth=0 maxnodes=64
@@ -484,6 +489,31 @@ probe() {
 
 # ---------------- 主流程 ----------------
 discover_pids
+STATS_HELPER="$(dirname "$(readlink -f "$0")")/scripts/ucm_spdk_stats.py"
+UCM_CONFIG="${UCM_CONFIG:-}"
+if [[ -z "$UCM_CONFIG" && -n "$MASTER_PID" ]]; then
+  UCM_CONFIG=$(python3 "$STATS_HELPER" --pid "$MASTER_PID" --config-path) || exit 1
+fi
+if [[ -z "$UCM_CONFIG" && ( "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ) ]]; then
+  UCM_CONFIG="$HOME/ucm-cache/ucm_config_$(basename "${CACHE_DIR%/}").yaml"
+fi
+STORE_BACKEND="${STORE_BACKEND:-auto}"
+if [[ "$STORE_BACKEND" == "auto" ]]; then
+  if [[ -f "$UCM_CONFIG" ]]; then
+    STORE_BACKEND=$(python3 "$STATS_HELPER" --config "$UCM_CONFIG" --detect) || exit 1
+  else
+    echo "WARN: 无法识别后端，按 Posix 显示；SPDK 请设置 STORE_BACKEND=spdk 与 UCM_CONFIG" >&2
+    STORE_BACKEND=posix
+  fi
+fi
+case "$STORE_BACKEND" in
+  spdk)
+    python3 "$STATS_HELPER" --config "$UCM_CONFIG" --host "$HOST" --port "$PORT" \
+      --mode "$MODE" --interval "$INTERVAL" --cycles "$MAX_CYCLES" --probe-seconds "$PROBE_SEC"
+    exit $? ;;
+  posix) ;;
+  *) echo "ERROR: STORE_BACKEND must be auto, posix or spdk" >&2; exit 2 ;;
+esac
 case "$MODE" in
   watch)     watch ;;
   probe)     probe ;;

@@ -45,15 +45,21 @@
 
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include "startup_lock.h"
+#include "gc_policy.h"
 
 #include "spdk/nvme.h"
 #include "spdk/env.h"
+#include "spdk/log.h"
 #include "spdk/string.h"
+
+SPDK_LOG_REGISTER_COMPONENT(ucm_spdk_gc)
 
 #define MAX_QD           1024
 #define IO_POOL_BUFS     256     /* shard-sized DMA bounce buffers */
@@ -132,8 +138,9 @@ SPDK_STATIC_ASSERT(MAX_DUMP_CTX + GC_MAX_PASS <= MAX_PINV,
  * GC (capacity management, the Posix store's background GC analog):
  * hotness[] (last-touch ms, stamped by lookup/load/commit from every
  * process) and pins[] (in-flight load counts) live in the shared segment.
- * When the free list is exhausted a dump triggers store_gc(), which
- * evicts the coldest unpinned blocks through the normal delete path
+ * A periodic timer requests reactor-owned threshold GC; an exhausted
+ * free list also triggers a small emergency pass. store_gc() evicts
+ * the coldest unpinned blocks through the normal delete path
  * (invalidation record + exact free-list push); -ENOSPC only when GC
  * cannot free anything (all pinned). The Posix GC's expensive parts
  * (directory sampling, stat/mtime sorting, unlink storms) are replaced
@@ -292,6 +299,8 @@ enum op_type {
 	OP_DELETE,
 	OP_BARRIER,         /* completes when the store drains */
 	OP_CANCEL_PARTIAL,  /* cancel incomplete dump contexts, then drain */
+	OP_GC,
+	OP_GC_STOP,
 };
 
 struct store_op {
@@ -380,18 +389,28 @@ build_shm_names(void)
 	snprintf(g_lease_name, sizeof(g_lease_name), "/ucm_spdk_lock_%016" PRIx64, h);
 }
 
+static int g_startup_fd = -1;
+
 static int
 store_maintenance_open(int exclusive)
 {
+	int rc = store_startup_open("/ucm_spdk_startup_lock", &g_startup_fd);
+
+	if (rc != 0) {
+		return rc;
+	}
 	g_maintenance_fd = shm_open("/ucm_spdk_maintenance_lock", O_CREAT | O_RDWR, 0600);
 	if (g_maintenance_fd < 0) {
-		return -errno;
+		rc = -errno;
+		store_startup_close(&g_startup_fd);
+		return rc;
 	}
 	if (flock(g_maintenance_fd, exclusive ? (LOCK_EX | LOCK_NB) : LOCK_SH) != 0) {
 		int rc = -errno;
 
 		close(g_maintenance_fd);
 		g_maintenance_fd = -1;
+		store_startup_close(&g_startup_fd);
 		return rc;
 	}
 	return 0;
@@ -419,6 +438,7 @@ store_maintenance_close(void)
 		close(g_maintenance_fd);
 		g_maintenance_fd = -1;
 	}
+	store_startup_close(&g_startup_fd);
 }
 
 static int
@@ -1472,45 +1492,31 @@ reactor_do_load(struct store_op *op)
 static int
 store_gc(int max_victims)
 {
-	struct {
-		uint8_t		id[16];
-		uint32_t	slot;
-		uint64_t	epoch;
-		uint64_t	hot;
-	} vics[GC_MAX_PASS];
+	struct gc_victim vics[GC_MAX_PASS];
 	int nvics = 0;
 
 	if (max_victims > GC_MAX_PASS) {
 		max_victims = GC_MAX_PASS;
 	}
+	/* Reserve queue room before dropping visibility, even if every NVMe
+	 * submission fails. Leave the dump contexts' existing reserve intact. */
+	if (max_victims > (int)(MAX_PINV - g_pinv_n) - MAX_DUMP_CTX) {
+		max_victims = (int)(MAX_PINV - g_pinv_n) - MAX_DUMP_CTX;
+	}
+	if (max_victims <= 0) {
+		return 0;
+	}
 
 	shm_lock();
 	for (uint32_t h = 0; h <= g_hash_mask; h++) {
 		struct hash_entry *e = &g_hash[h];
-		uint64_t hot;
-		int k;
 
 		if (e->used != 1) {
 			continue;
 		}
-		if (__atomic_load_n(&g_pins[e->slot], __ATOMIC_RELAXED) != 0) {
-			continue;
-		}
-		hot = g_hotness[e->slot];
-		if (nvics < max_victims) {
-			k = nvics++;
-		} else if (hot < vics[nvics - 1].hot) {
-			k = nvics - 1;
-		} else {
-			continue;
-		}
-		while (k > 0 && vics[k - 1].hot > hot) {
-			vics[k] = vics[k - 1];
-			k--;
-		}
-		memcpy(vics[k].id, e->id, 16);
-		vics[k].slot = e->slot;
-		vics[k].hot = hot;
+		store_gc_consider(vics, &nvics, max_victims, e->id, e->slot,
+				  __atomic_load_n(&g_pins[e->slot], __ATOMIC_RELAXED),
+				  g_hotness[e->slot]);
 	}
 	for (int i = 0; i < nvics; i++) {
 		vics[i].epoch = ++g_epoch;
@@ -1855,6 +1861,7 @@ void reactor_pause(void);
 void reactor_resume(void);
 int store_quiesce(void);
 static int store_sync_op(int type);
+void store_gc_stop(void);
 
 /*
  * The Cache stage explicitly registers its complete SHM data region once
@@ -1980,6 +1987,7 @@ store_unregister_memory(void *addr, uint64_t size)
 	start = (uint64_t)(uintptr_t)addr & ~(REG_PAGE_SIZE - 1);
 	end = ((uint64_t)(uintptr_t)addr + size + REG_PAGE_SIZE - 1)
 	      & ~(REG_PAGE_SIZE - 1);
+	store_gc_stop();
 
 	/* No new Cache work reaches the backend at this point. Cancel partial
 	 * blocks that cannot commit without future submissions, then fence all
@@ -2042,11 +2050,122 @@ static int		g_reactor_started;
 static pthread_mutex_t	g_reactor_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t	g_reactor_paused_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t	g_reactor_resume_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t		g_barriers_n;
+
+static pthread_t	g_gc_tid;
+static pthread_mutex_t	g_gc_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t	g_gc_cv = PTHREAD_COND_INITIALIZER;
+static int		g_gc_started;
+static int		g_gc_stop_req; /* timer mutex */
+static int		g_gc_enabled;  /* atomic: timer/lifecycle -> reactor */
+static int		g_gc_requested; /* atomic: timer -> reactor */
+static double		g_gc_threshold;
+static double		g_gc_recycle;
+static uint32_t		g_gc_interval;
+static int		g_gc_fd = -1;
+/* The following cycle state belongs exclusively to the reactor. */
+static int		g_gc_owner;
+static uint32_t		g_gc_remaining;
+static uint64_t		g_gc_cycle_selected;
+static uint64_t		g_gc_cycle_errors;
+
+static int
+gc_invalidations_drained(void)
+{
+	if (g_pinv_n != 0) {
+		return 0;
+	}
+	for (int i = 0; i < NUM_REC_OPS; i++) {
+		if (g_rops[i].active) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static void
+advance_periodic_gc(void)
+{
+	int enabled = __atomic_load_n(&g_gc_enabled, __ATOMIC_ACQUIRE);
+	const char *reason = "below threshold or rounded reclaim count is zero";
+
+	if (!g_gc_owner) {
+		if (!__atomic_exchange_n(&g_gc_requested, 0, __ATOMIC_ACQ_REL) ||
+		    !enabled || g_barriers_n != 0 || g_stalled || !g_healthy) {
+			return;
+		}
+		if (flock(g_gc_fd, LOCK_EX | LOCK_NB) != 0) {
+			SPDK_DEBUGLOG(ucm_spdk_gc, "SPDK GC pid=%ld region=%s: cycle lease unavailable; skipping\n",
+				      (long)getpid(), g_shm_name);
+			if (errno != EWOULDBLOCK && errno != EAGAIN) {
+				SPDK_ERRLOG("SPDK GC pid=%ld region=%s: cannot acquire cycle lease: %s\n",
+					    (long)getpid(), g_shm_name, strerror(errno));
+			}
+			return;
+		}
+		g_gc_owner = 1;
+		g_gc_cycle_selected = 0;
+		g_gc_cycle_errors = g_err_count;
+	}
+	/* One batch at a time, including durable callbacks and pin retirement.
+	 * This bounds queue pressure and holds the gate through actual frees. */
+	if (!gc_invalidations_drained()) {
+		return;
+	}
+	if (!enabled || g_barriers_n != 0 || g_stalled || !g_healthy) {
+		reason = !enabled ? "stopping" : (g_barriers_n ? "barrier requested" : "engine unhealthy");
+		goto done;
+	}
+	if (g_gc_remaining == 0) {
+		uint32_t live, capacity, free_slots;
+
+		shm_lock();
+		live = g_live_count;
+		capacity = g_nslots;
+		free_slots = g_free_top;
+		g_gc_remaining = store_gc_round_count(live, capacity,
+						    g_gc_threshold, g_gc_recycle);
+		shm_unlock();
+		SPDK_NOTICELOG("SPDK GC check pid=%ld region=%s: live=%u capacity=%u free=%u "
+			       "usage=%.2f%% threshold=%.2f%% trigger=%s round_candidates=%u\n",
+			       (long)getpid(), g_shm_name, live, capacity, free_slots,
+			       capacity ? 100.0 * live / capacity : 0.0,
+			       100.0 * g_gc_threshold, g_gc_remaining ? "yes" : "no", g_gc_remaining);
+		if (g_gc_remaining == 0) {
+			goto done;
+		}
+	}
+	{
+		int count = store_gc(g_gc_remaining > GC_MAX_PASS ?
+				     GC_MAX_PASS : (int)g_gc_remaining);
+
+		if (count == 0) {
+			SPDK_WARNLOG("SPDK GC pid=%ld region=%s: no unpinned candidates; "
+				     "deferring remaining=%u until next interval\n",
+				     (long)getpid(), g_shm_name, g_gc_remaining);
+			reason = "no unpinned candidates";
+			goto done; /* all remaining candidates pinned: retry next interval */
+		}
+		g_gc_remaining -= (uint32_t)count;
+		g_gc_cycle_selected += (uint64_t)count;
+	}
+	return;
+done:
+	if (g_gc_cycle_selected != 0 || strcmp(reason, "below threshold or rounded reclaim count is zero") != 0) {
+		SPDK_NOTICELOG("SPDK GC cycle end pid=%ld region=%s: selected=%ju "
+			       "invalidation_queue_drained=yes engine_errors_during_cycle=%ju reason=%s "
+			       "(selected is not a successful-free counter)\n",
+			       (long)getpid(), g_shm_name, (uintmax_t)g_gc_cycle_selected,
+			       (uintmax_t)(g_err_count - g_gc_cycle_errors), reason);
+	}
+	g_gc_remaining = 0;
+	g_gc_owner = 0;
+	flock(g_gc_fd, LOCK_UN);
+}
 
 /* parked ops owned by the reactor */
 static struct store_op *g_pending[MAX_PENDING];
 static struct store_op *g_barriers[MAX_PENDING];
-static uint32_t		g_barriers_n;
 
 static void
 op_complete(struct store_op *op, int rc)
@@ -2062,7 +2181,8 @@ op_complete(struct store_op *op, int rc)
 static void
 process_op(struct store_op *op)
 {
-	if (g_stalled && op->type != OP_BARRIER && op->type != OP_CANCEL_PARTIAL) {
+	if (g_stalled && op->type != OP_BARRIER && op->type != OP_CANCEL_PARTIAL &&
+	    op->type != OP_GC_STOP) {
 		op_complete(op, -EIO);
 		free(op);
 		return;
@@ -2110,8 +2230,12 @@ process_op(struct store_op *op)
 		op_complete(op, rc);
 		break;
 	}
+	case OP_GC:
+		op_complete(op, store_gc((int)op->count));
+		break;
 	case OP_BARRIER:
 	case OP_CANCEL_PARTIAL:
+	case OP_GC_STOP:
 		if (op->type == OP_CANCEL_PARTIAL) {
 			for (int i = 0; i < MAX_DUMP_CTX; i++) {
 				if (g_dctx[i].active && g_dctx[i].commit_phase == 0) {
@@ -2232,7 +2356,10 @@ static void
 advance_barriers(void)
 {
 	for (uint32_t i = 0; i < g_barriers_n; ) {
-		if (store_drained() || (g_stalled && store_io_drained())) {
+		if ((g_barriers[i]->type == OP_GC_STOP &&
+		     !g_gc_owner && gc_invalidations_drained()) ||
+		    (g_barriers[i]->type != OP_GC_STOP &&
+		     (store_drained() || (g_stalled && store_io_drained())))) {
 			struct store_op *op = g_barriers[i];
 
 			g_barriers[i] = g_barriers[--g_barriers_n];
@@ -2269,6 +2396,7 @@ reactor_main(void *arg)
 		drain_op_ring();
 		advance_pending();
 		store_poll();
+		advance_periodic_gc();
 		advance_barriers();
 	}
 	return NULL;
@@ -2404,6 +2532,94 @@ store_quiesce(void)
 	return store_sync_op(OP_BARRIER);
 }
 
+static void *
+gc_timer_main(void *arg)
+{
+	(void)arg;
+	pthread_setname_np(pthread_self(), "ucm_spdk_gc");
+	pthread_mutex_lock(&g_gc_mu);
+	while (!g_gc_stop_req) {
+		struct timespec deadline;
+
+		__atomic_store_n(&g_gc_requested, 1, __ATOMIC_RELEASE);
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += g_gc_interval;
+		while (!g_gc_stop_req) {
+			int rc = pthread_cond_timedwait(&g_gc_cv, &g_gc_mu, &deadline);
+
+			if (rc == ETIMEDOUT) {
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&g_gc_mu);
+	return NULL;
+}
+
+int
+store_gc_start(double threshold, double recycle, uint32_t interval)
+{
+	char name[96];
+	int rc;
+
+	if (!store_gc_config_valid(threshold, recycle, interval)) {
+		return -EINVAL;
+	}
+	if (!g_reactor_started || g_shm == NULL) {
+		return -ENODEV;
+	}
+	if (g_gc_started) {
+		return -EALREADY;
+	}
+	snprintf(name, sizeof(name), "%s_gc", g_shm_name);
+	g_gc_fd = store_gc_gate_open(name);
+	if (g_gc_fd < 0) {
+		return g_gc_fd;
+	}
+	g_gc_threshold = threshold;
+	g_gc_recycle = recycle;
+	g_gc_interval = interval;
+	g_gc_stop_req = 0;
+	__atomic_store_n(&g_gc_enabled, 1, __ATOMIC_RELEASE);
+	rc = pthread_create(&g_gc_tid, NULL, gc_timer_main, NULL);
+	if (rc != 0) {
+		__atomic_store_n(&g_gc_enabled, 0, __ATOMIC_RELEASE);
+		close(g_gc_fd);
+		g_gc_fd = -1;
+		return -rc;
+	}
+	g_gc_started = 1;
+	SPDK_NOTICELOG("SPDK GC started pid=%ld region=%s: capacity=%u slots "
+		       "threshold=%.2f%% recycle=%.2f%% interval=%us\n",
+		       (long)getpid(), g_shm_name, g_nslots, 100.0 * threshold,
+		       100.0 * recycle, interval);
+	return 0;
+}
+
+void
+store_gc_stop(void)
+{
+	if (!g_gc_started) {
+		return;
+	}
+	pthread_mutex_lock(&g_gc_mu);
+	g_gc_stop_req = 1;
+	__atomic_store_n(&g_gc_enabled, 0, __ATOMIC_RELEASE);
+	pthread_cond_signal(&g_gc_cv);
+	pthread_mutex_unlock(&g_gc_mu);
+	pthread_join(g_gc_tid, NULL);
+	/* Reactor retires the current batch and releases its gate before close.
+	 * Unlike a store barrier this does not wait for partial Cache dumps. */
+	while (store_sync_op(OP_GC_STOP) == -EBUSY) {
+		sched_yield();
+	}
+	__atomic_store_n(&g_gc_requested, 0, __ATOMIC_RELEASE);
+	close(g_gc_fd);
+	g_gc_fd = -1;
+	g_gc_started = 0;
+	SPDK_NOTICELOG("SPDK GC stopped pid=%ld region=%s\n", (long)getpid(), g_shm_name);
+}
+
 /*
  * Pause the reactor: it finishes the current step and parks, after
  * which the calling thread may use the qpair directly (store_poll,
@@ -2461,6 +2677,7 @@ reactor_start(void)
 void
 reactor_stop(void)
 {
+	store_gc_stop();
 	if (!g_reactor_started) {
 		return;
 	}
@@ -2763,11 +2980,14 @@ store_resolve_region(void)
 		if (g_nslots > g_index_slots || g_nslots > g_pool_capacity) {
 			return -EINVAL;
 		}
+		rc = store_session_publish(g_lease_fd, NULL);
+		if (rc != 0) { return rc; }
 		rc = store_format();
 		if (rc == 0) {
 			g_region_reset = 1;
 			printf("Formatted.\n");
 		}
+		flock(g_maintenance_fd, LOCK_SH);
 		return rc;
 	}
 
@@ -4409,17 +4629,23 @@ store_device_cleanup(void)
  * SPDK env, probes the device, configures geometry, opens/creates the SHM
  * segment, runs superblock validation/recovery and starts the reactor.
  *
- * Returns 0 on success; -ENOENT when the device is unavailable (caller
- * should fall back to lookup-only mode); negative errno otherwise.
+ * Returns 0 on success; negative errno on failure, including -ENODEV
+ * when the device is unavailable. A data worker must fail initialization.
  */
-int
-store_engine_init(const char *trid_str, uint32_t nslots_req,
+static int
+store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 		  uint32_t layers, uint32_t shard_kb, uint64_t offset_gib,
-		  int format)
+		  int format, const char *session)
 {
 	struct spdk_env_opts opts;
 	int rc;
 	int env_started = 0;
+	cpu_set_t caller_cpus;
+	int same_session = 0;
+
+	if (session != NULL && (session[0] == '\0' || strlen(session) >= STORE_SESSION_SIZE)) {
+		return -EINVAL;
+	}
 
 	/* 1. parameters (from config, not CLI) */
 	g_layers = layers;
@@ -4435,6 +4661,13 @@ store_engine_init(const char *trid_str, uint32_t nslots_req,
 		return -EINVAL;
 	}
 
+	/* Wait before creating a controller: no admin poller services keep-alive
+	 * while another process owns startup. Keep the gate until reactor start. */
+	rc = store_maintenance_open(g_format && session == NULL);
+	if (rc != 0) {
+		return rc;
+	}
+
 	/* 2. SPDK env (idempotent — second call is a no-op if same opts) */
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
@@ -4446,10 +4679,22 @@ store_engine_init(const char *trid_str, uint32_t nslots_req,
 		 * PA default and is root-only anyway (vfio). */
 		opts.iova_mode = "va";
 	}
-	if (spdk_env_init(&opts) < 0) {
-		return -ENOMEM;
+	/* DPDK pins its main lcore (CPU 0 by default). This thread belongs to
+	 * vLLM, and subsequent Cache/reactor threads inherit its affinity. */
+	if (sched_getaffinity(0, sizeof(caller_cpus), &caller_cpus) != 0) {
+		rc = -errno;
+		goto fail;
 	}
-	env_started = 1;
+	int env_rc = spdk_env_init(&opts);
+	env_started = env_rc >= 0;
+	if (sched_setaffinity(0, sizeof(caller_cpus), &caller_cpus) != 0) {
+		rc = -errno;
+		goto fail;
+	}
+	if (env_rc < 0) {
+		rc = -ENOMEM;
+		goto fail;
+	}
 
 	/* 3. parse trid */
 	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
@@ -4465,7 +4710,7 @@ store_engine_init(const char *trid_str, uint32_t nslots_req,
 	rc = spdk_nvme_probe(&g_trid, NULL, probe_cb, attach_cb, NULL);
 	if (rc != 0 || g_ctrlr == NULL || g_ns == NULL) {
 		rc = -ENODEV;
-		goto fail;   /* device unavailable → lookup-only */
+		goto fail;
 	}
 
 	/* 5. geometry */
@@ -4497,13 +4742,22 @@ store_engine_init(const char *trid_str, uint32_t nslots_req,
 		g_pool_capacity = pool_sectors / g_slot_sectors;
 	}
 	build_shm_names();
-	rc = store_maintenance_open(g_format);
-	if (rc != 0) {
-		goto fail;
-	}
 	rc = store_lease_open();
 	if (rc != 0) {
 		goto fail;
+	}
+	if (session != NULL && format) {
+		rc = store_session_matches(g_lease_fd, session);
+		if (rc < 0) { goto fail; }
+		same_session = rc;
+		if (same_session) {
+			g_format = 0;
+			printf("Format already completed for service session %s; joining.\n", session);
+		} else if (!g_shm_recovery_owner || store_maintenance_upgrade() != 0) {
+			fprintf(stderr, "format requires all previous SPDK store processes to exit\n");
+			rc = -EBUSY;
+			goto fail;
+		}
 	}
 
 	/* 6. qpair + buffers */
@@ -4557,6 +4811,17 @@ store_engine_init(const char *trid_str, uint32_t nslots_req,
 	 * (model switch) invalidates all existing blocks in place instead
 	 * of refusing to boot. */
 	g_last_progress = spdk_get_ticks();
+	if (same_session) {
+		struct superblock sb;
+
+		rc = store_sb_read(&sb);
+		if (rc != 0) { goto fail; }
+		if (store_sb_geometry_ok(&sb) != 0 || sb.nslots != g_nslots) {
+			fprintf(stderr, "incompatible geometry/capacity within service session\n");
+			rc = -EINVAL;
+			goto fail;
+		}
+	}
 	rc = store_resolve_region();
 	if (rc != 0) { goto fail; }
 
@@ -4584,6 +4849,14 @@ store_engine_init(const char *trid_str, uint32_t nslots_req,
 	/* 8. reactor */
 	rc = reactor_start();
 	if (rc != 0) { goto fail; }
+	if (format) {
+		rc = store_session_publish(g_lease_fd, session);
+		if (rc != 0) {
+			reactor_stop();
+			goto fail;
+		}
+	}
+	store_startup_close(&g_startup_fd);
 
 	return 0;
 
@@ -4593,6 +4866,24 @@ fail:
 		spdk_env_fini();
 	}
 	return rc;
+}
+
+int
+store_engine_init(const char *trid_str, uint32_t nslots_req,
+		  uint32_t layers, uint32_t shard_kb, uint64_t offset_gib, int format)
+{
+	return store_engine_init_session(trid_str, nslots_req, layers, shard_kb,
+					offset_gib, format, NULL);
+}
+
+int
+store_engine_init_for_session(const char *trid_str, uint32_t nslots_req,
+		  uint32_t layers, uint32_t shard_kb, uint64_t offset_gib,
+		  int format, const char *session)
+{
+	if (session == NULL) { return -EINVAL; }
+	return store_engine_init_session(trid_str, nslots_req, layers, shard_kb,
+					offset_gib, format, session);
 }
 
 void
@@ -4632,6 +4923,7 @@ store_lookup_init(void)
 		store_lease_close();
 		store_maintenance_close();
 	}
+	store_startup_close(&g_startup_fd);
 	return rc;
 }
 
@@ -4664,7 +4956,28 @@ uint32_t store_slot_sectors(void) { return g_slot_sectors; }
 uint32_t store_sector_size(void) { return g_sector_size; }
 int store_is_healthy(void) { return g_healthy; }
 uint64_t store_epoch_value(void) { return g_epoch; }
-int store_gc_public(int max_victims) { return store_gc(max_victims); }
+int
+store_gc_public(int max_victims)
+{
+	struct syncw w;
+	struct store_op *op;
+	int rc;
+
+	if (max_victims <= 0) { return 0; }
+	if (!g_reactor_started) { return -ENODEV; }
+	syncw_init(&w);
+	op = op_new(OP_GC, NULL, NULL, NULL, &w);
+	if (op == NULL) {
+		rc = -ENOMEM;
+	} else {
+		op->count = (uint32_t)max_victims;
+		rc = op_submit(op);
+		if (rc == 0) { rc = syncw_wait(&w); }
+	}
+	pthread_mutex_destroy(&w.mu);
+	pthread_cond_destroy(&w.cv);
+	return rc;
+}
 void store_set_direct_dma(int enable) { g_direct_dma = enable; }
 uint64_t store_registered_bytes(void) { return g_reg_total_bytes; }
 
@@ -4749,6 +5062,12 @@ main(int argc, char **argv)
 		return rc == 0 ? 0 : 1;
 	}
 
+	/* As in library init, wait for startup before connecting to the target. */
+	rc = store_maintenance_open(g_format);
+	if (rc != 0) {
+		fprintf(stderr, "store maintenance lease failed (%d)\n", rc);
+		return 1;
+	}
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
 	opts.name = "ucm_spdk_store";
@@ -4758,6 +5077,7 @@ main(int argc, char **argv)
 	}
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
+		store_maintenance_close();
 		return 1;
 	}
 
@@ -4797,12 +5117,6 @@ main(int argc, char **argv)
 		goto exit_fini;
 	}
 	build_shm_names();
-	rc = store_maintenance_open(g_format);
-	if (rc != 0) {
-		fprintf(stderr, "store maintenance lease failed (%d)\n", rc);
-		rc = 1;
-		goto exit_free;
-	}
 	rc = store_lease_open();
 	if (rc != 0) {
 		fprintf(stderr, "store lease failed (%d)\n", rc);
@@ -4925,6 +5239,7 @@ main(int argc, char **argv)
 		rc = 1;
 		goto exit_free;
 	}
+	store_startup_close(&g_startup_fd);
 
 	{
 		int fresh = g_format;
@@ -5007,6 +5322,7 @@ exit_free:
 		spdk_nvme_ctrlr_free_io_qpair(g_qpair);
 	}
 exit_fini:
+	store_maintenance_close();
 	{
 		struct spdk_nvme_detach_ctx *detach_ctx = NULL;
 

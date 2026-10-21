@@ -17,6 +17,9 @@ extern "C" {
 /* Lifecycle */
 int spdk_store_init(const char *trid_str, uint32_t nslots, uint32_t layers,
                     uint32_t shard_kb, uint64_t offset_gib, int format);
+/* A shared, fresh service ID makes format run once across its workers. */
+int spdk_store_init_for_session(const char *trid_str, uint32_t nslots, uint32_t layers,
+                    uint32_t shard_kb, uint64_t offset_gib, int format, const char *session);
 void spdk_store_fini(void);
 int spdk_store_lookup_init(void);
 int spdk_store_lookup_init_region(const char *trid_str, uint64_t offset_gib);
@@ -41,8 +44,13 @@ int spdk_store_load_submit(const uint8_t id[16], uint32_t first, uint32_t count,
                            spdk_store_cb cb, void *arg);
 int spdk_store_delete(const uint8_t id[16], spdk_store_cb cb, void *arg);
 
-/* GC */
+/* GC: lifecycle calls are serialized with engine lifecycle by the worker.
+ * Start requires a running reactor; stop drains the current invalidations.
+ * Synchronous calls must not run on the reactor or while it is paused. */
 int spdk_store_gc(int max_victims);
+int spdk_store_gc_start(double trigger_threshold_ratio, double recycle_percent,
+                        uint32_t check_interval_sec);
+void spdk_store_gc_stop(void);
 
 /* Stats */
 uint64_t spdk_store_used_bytes(void);

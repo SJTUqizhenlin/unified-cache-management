@@ -3,3 +3,5 @@ graft ucm
 graft examples
 graft benchmarks
 include testSPDK/ucm_spdk_store/ucm_spdk_store.c
+include testSPDK/ucm_spdk_store/startup_lock.h
+include testSPDK/ucm_spdk_store/gc_policy.h
