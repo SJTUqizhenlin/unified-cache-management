@@ -39,8 +39,7 @@
  * Configuration keys (all under ucm_connector_config):
  *   spdk_trid            "trtype:PCIe traddr:0000:84:00.0" or
  *                         "trtype:RDMA adrfam:IPv4 traddr:IP trsvcid:4420"
- *   spdk_capacity_gb     active capacity in GiB (default 500; fixes the
- *                        slot count only at first format)
+ *   spdk_capacity_gb     active data capacity in GiB (default 500)
  *   spdk_format          1 = clear metadata once per service startup (default 0)
  *   spdk_offset_gib      LBA offset of the pool region (default 0)
  *   shard_size/block_size  runtime model geometry (the same keys the
@@ -63,18 +62,12 @@
 #include <mutex>
 #include <new>
 #include <thread>
+#include <sched.h>
 #include <unordered_map>
 
 #include <cerrno>
 
 #include "ucm_spdk_engine.h"
-
-/*
- * The engine functions are resolved at runtime: either the engine static
- * library is linked into this .so (preferred, via build_so.sh with
- * ENGINE_LINK=1), or this .so runs with stubs (interface-only mode for
- * pipeline registration testing). The Makefile in cc/ builds the engine.
- */
 
 #include "logger/logger.h"
 #include "metrics_api.h"
@@ -90,6 +83,16 @@ using Detail::TaskDesc;
 using Detail::TaskHandle;
 
 static constexpr const char *kStoreName = "SpdkStore";
+
+class EngineScope {
+    spdk_store_engine* previous_;
+public:
+    explicit EngineScope(spdk_store_engine* engine)
+        : previous_(spdk_store_engine_select(engine)) {}
+    ~EngineScope() { spdk_store_engine_select(previous_); }
+    EngineScope(const EngineScope&) = delete;
+    EngineScope& operator=(const EngineScope&) = delete;
+};
 
 /* ---- handle registry: TaskHandle → completion state ---- */
 
@@ -171,6 +174,7 @@ shard_done_cb(void *arg, int status)
 /* ---- the store ---- */
 
 class SpdkStore : public StoreV1 {
+    spdk_store_engine* engine_{nullptr};
     bool initialized_{false};
     bool lookupOnly_{false};
     uint32_t blockSize_{0};       /* bytes per block */
@@ -193,20 +197,25 @@ class SpdkStore : public StoreV1 {
 public:
     ~SpdkStore() override
     {
-        if (initialized_) {
-            if (!lookupOnly_) { spdk_store_gc_stop(); }
-            if (registeredHost_) {
-                spdk_store_unregister_memory(registeredHost_, registeredHostSize_);
-                registeredHost_ = nullptr;
-                registeredHostSize_ = 0;
-            }
-            if (lookupOnly_) {
-                spdk_store_lookup_fini();
-            } else {
-                spdk_store_reactor_stop();
-                spdk_store_fini();
+        if (!engine_) { return; }
+        {
+            EngineScope scope(engine_);
+            if (initialized_) {
+                if (!lookupOnly_) { spdk_store_gc_stop(); }
+                if (registeredHost_) {
+                    spdk_store_unregister_memory(registeredHost_, registeredHostSize_);
+                    registeredHost_ = nullptr;
+                    registeredHostSize_ = 0;
+                }
+                if (lookupOnly_) {
+                    spdk_store_lookup_fini();
+                } else {
+                    spdk_store_reactor_stop();
+                    spdk_store_fini();
+                }
             }
         }
+        spdk_store_engine_destroy(engine_);
     }
 
     std::string Readme() const override
@@ -217,6 +226,9 @@ public:
     Status Setup(const Dictionary &config) override
     {
         if (initialized_) { return Status::OK(); }
+        if (!engine_) { engine_ = spdk_store_engine_create(); }
+        if (!engine_) { return Status::OutOfMemory(); }
+        EngineScope scope(engine_);
 
         std::string trid = "trtype:PCIe traddr:0000:84:00.0";
         config.Get("spdk_trid", trid);
@@ -263,7 +275,7 @@ public:
                 "block_size must be divisible by a nonzero, KiB-aligned shard_size");
         }
         uint64_t nshards = blockSize / shardSize;
-        if (nshards > std::numeric_limits<uint32_t>::max() ||
+        if (nshards > 256 || blockSize > std::numeric_limits<uint32_t>::max() ||
             shardSize > std::numeric_limits<uint32_t>::max()) {
             return Status::InvalidParam("SPDK block geometry exceeds 32-bit limits");
         }
@@ -271,6 +283,9 @@ public:
         uint64_t capacityGb = 500;
         config.GetNumber("spdk_capacity_gb", capacityGb);
         if (capacityGb == 0) { capacityGb = 500; }
+        if (capacityGb > (std::numeric_limits<uint64_t>::max() >> 30)) {
+            return Status::InvalidParam("SPDK capacity exceeds 64-bit limits");
+        }
 
         bool gcEnable = true;
         double gcThreshold = 0.7;
@@ -301,13 +316,30 @@ public:
         /* capacity in slots */
         uint64_t slotBytes = nshards * shardKb * 1024;
         uint64_t nslots = (capacityGb << 30) / slotBytes;
-        if (nslots == 0) {
-            return Status::Error("invalid capacity: 0 slots");
+        if (nslots == 0 || nslots > std::numeric_limits<uint32_t>::max()) {
+            return Status::Error("SPDK capacity requires between 1 and UINT32_MAX slots");
         }
 
         blockSize_ = static_cast<uint32_t>(slotBytes);
         shardSize_ = static_cast<uint32_t>(shardSize);
         nshards_ = static_cast<uint32_t>(nshards);
+
+        // Cache registers its SHM before data submission; no bounce payloads are needed.
+        if (spdk_store_set_direct_only(1) != 0) {
+            return Status::Error("failed to configure SPDK direct-only mode");
+        }
+        std::vector<ssize_t> affinity;
+        config.Get("cpu_affinity_cores", affinity);
+        std::vector<int> cores;
+        for (auto cpu : affinity) {
+            if (cpu < 0 || cpu >= CPU_SETSIZE) {
+                return Status::InvalidParam("invalid SPDK reactor CPU core");
+            }
+            cores.push_back(static_cast<int>(cpu));
+        }
+        if (spdk_store_set_cpu_affinity(cores.data(), static_cast<uint32_t>(cores.size())) != 0) {
+            return Status::Error("failed to configure SPDK reactor affinity");
+        }
 
         UC_INFO("{}: trid='{}' capacity={}GB ({} slots) shard={}KB x {}",
                 kStoreName, trid, capacityGb, nslots, shardKb, nshards);
@@ -352,6 +384,7 @@ public:
 
     Expected<std::vector<uint8_t>> Lookup(const BlockId *blocks, size_t num) override
     {
+        EngineScope scope(engine_);
         if (num == 0) { return std::vector<uint8_t>{}; }
 
         auto results = std::vector<uint8_t>(num, 0);
@@ -370,6 +403,7 @@ public:
 
     Expected<ssize_t> LookupOnPrefix(const BlockId *blocks, size_t num) override
     {
+        EngineScope scope(engine_);
         if (num == 0) { return static_cast<ssize_t>(-1); }
 
         /* build contiguous id array for the C API */
@@ -387,6 +421,7 @@ public:
 
     Expected<ssize_t> LookupOnReverse(const BlockId *blocks, size_t num) override
     {
+        EngineScope scope(engine_);
         for (ssize_t i = static_cast<ssize_t>(num) - 1; i >= 0; i--) {
             const auto *id = reinterpret_cast<const uint8_t *>(blocks[i].data());
             if (spdk_store_lookup(id)) {
@@ -405,6 +440,7 @@ public:
 
     Status CheckHealth() override
     {
+        EngineScope scope(engine_);
         if (lookupOnly_) { return Status::OK(); }
         return spdk_store_healthy() ? Status::OK()
                                     : Status::Error("spdk store unhealthy");
@@ -412,6 +448,7 @@ public:
 
     Status RegisterHostMemory(void* addr, size_t size) override
     {
+        EngineScope scope(engine_);
         if (lookupOnly_) { return Status::OK(); }
         if (!initialized_ || addr == nullptr || size == 0) {
             return Status::InvalidParam("invalid SPDK host-memory registration");
@@ -429,6 +466,7 @@ public:
 
     void UnregisterHostMemory(void* addr, size_t size) override
     {
+        EngineScope scope(engine_);
         if (lookupOnly_ || addr == nullptr || size == 0) { return; }
         spdk_store_gc_stop();
         auto rc = spdk_store_unregister_memory(addr, size);
@@ -445,6 +483,7 @@ public:
 
     Expected<TaskHandle> Load(TaskDesc task) override
     {
+        EngineScope scope(engine_);
         if (lookupOnly_) { return Status::Error("lookup-only mode"); }
         if (task.empty()) { return Status::Error("empty task"); }
 
@@ -488,6 +527,7 @@ public:
 
     Expected<TaskHandle> Dump(TaskDesc task) override
     {
+        EngineScope scope(engine_);
         if (lookupOnly_) { return Status::Error("lookup-only mode"); }
         if (task.empty()) { return Status::Error("empty task"); }
 

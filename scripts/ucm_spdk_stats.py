@@ -11,6 +11,8 @@ import sys
 import time
 import urllib.request
 
+from ucm_metric_summary import fawa_start_load_summary, fawa_wait_summary, start_load_summary
+
 
 def load_config(path):
     import yaml
@@ -128,6 +130,9 @@ def cache_metrics(host, port):
             samples = re.findall(r"^ucm:" + name + r"(?:\{[^\n]*\})?\s+([^\s]+)$", text, re.M)
             values[name] = sum(map(float, samples)) if samples else None
         print("  UCM /metrics (cumulative, ranks summed):")
+        print("    " + start_load_summary(text))
+        print("    " + fawa_start_load_summary(text))
+        print("    " + fawa_wait_summary(text))
         for name, value in values.items():
             print(f"    {name}: {value:,.0f}" if value is not None else f"    {name}: N/A")
         for label, hit, query in (
@@ -164,9 +169,11 @@ def main():
     parser.add_argument("--port", default="7780")
     parser.add_argument("--mode", choices=("snapshot", "watch", "probe"), default="snapshot")
     parser.add_argument("--interval", type=float, default=10)
-    parser.add_argument("--cycles", type=int, default=0)
+    parser.add_argument("--cycles", type=int, default=None)
     parser.add_argument("--probe-seconds", type=float, default=10)
     args = parser.parse_args()
+    if args.cycles is None:
+        args.cycles = 1 if args.mode == "snapshot" else 0
     if args.config_path:
         argv = Path(f"/proc/{args.pid}/cmdline").read_bytes().decode().split("\0")
         if "--kv-transfer-config" in argv:
@@ -192,8 +199,6 @@ def main():
     report(previous)
     cache_metrics(args.host, args.port)
     sys.stdout.flush()
-    if args.mode == "snapshot":
-        return
     cycles = 1
     while args.mode == "probe" or not args.cycles or cycles < args.cycles:
         time.sleep(args.probe_seconds if args.mode == "probe" else args.interval)
@@ -205,7 +210,7 @@ def main():
             if args.mode == "probe":
                 raise
         else:
-            report(current, previous)
+            report(current, None if args.mode == "snapshot" else previous)
             previous = current
             cache_metrics(args.host, args.port)
         sys.stdout.flush()

@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -14,7 +15,8 @@ spec = importlib.util.spec_from_file_location(
     "ucm_spdk_stats", Path(__file__).resolve().parents[1] / "scripts/ucm_spdk_stats.py"
 )
 stats = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(stats)
+with patch.object(sys, "path", [str(Path(__file__).resolve().parents[1] / "scripts"), *sys.path]):
+    spec.loader.exec_module(stats)
 
 
 class SpdkStatsTest(unittest.TestCase):
@@ -96,6 +98,28 @@ class SpdkStatsTest(unittest.TestCase):
             stats.cache_metrics("127.0.0.1", "7780")
         self.assertIn("cache_load_bytes_total: 4,096", out.getvalue())
         self.assertIn("cache_dump_bytes_total: N/A", out.getvalue())
+        self.assertIn("FAWA load barrier", out.getvalue())
+        self.assertIn("start_load_kv total [all calls, including no-load]", out.getvalue())
+        self.assertIn("avg=N/A p99=N/A", out.getvalue())
+
+    def test_snapshot_repeats_cumulative_reports_without_final_sleep(self):
+        for extra, count in [([], 1), (["--cycles", "3", "--interval", "5"], 3)]:
+            with self.subTest(extra=extra), \
+                    patch.object(sys, "argv", ["stats", "--config", "fake", *extra]), \
+                    patch.object(stats, "load_config", return_value=self.config()), \
+                    patch.object(stats, "resolve_target", return_value=("nqn.test", "Nvme0n1")), \
+                    patch.object(stats, "sample", return_value=self.sample()) as sample, \
+                    patch.object(stats, "report") as report, \
+                    patch.object(stats, "cache_metrics") as metrics, \
+                    patch.object(stats.time, "sleep") as sleep, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                stats.main()
+                self.assertEqual(sample.call_count, count)
+                self.assertEqual(report.call_count, count)
+                self.assertEqual(metrics.call_count, count)
+                self.assertEqual(sleep.call_count, count - 1)
+                for call in report.call_args_list:
+                    self.assertTrue(len(call.args) == 1 or call.args[1] is None)
 
 
 if __name__ == "__main__":

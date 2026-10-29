@@ -1,0 +1,31 @@
+
+# Set storage_backends and spdk_trid for your deployment.
+# The NVMe-oF target must be running before workers initialize.
+# WARNING: spdk_format: 1 resets the region for a new service session.
+# Use 0 to recover compatible existing data; geometry changes can still reset it.
+# V4 FAWA automatically splits this total data capacity across two partitions.
+# At base offset 0 and total 500 GiB: FA starts at 0, WA at 252 GiB.
+# Reserve 504 GiB on the namespace (data plus aligned metadata reservations).
+# Stop all old-version workers before upgrading to the multi-instance engine.
+
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "Cache|Spdk"
+      # Retained for server_test_host.sh's storage_backends precheck only.
+      storage_backends: "/home/qizhenlin/ucm-cache/test"
+      posix_capacity_gb: 500
+      spdk_trid: "trtype:RDMA adrfam:IPv4 traddr:192.168.1.12 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:c1"
+      spdk_capacity_gb: 500
+      spdk_offset_gib: 0
+      spdk_format: 1
+      cache_buffer_capacity_gb: 100
+      share_buffer_enable: true
+      # Advise huge pages for the shared buffers registered with SPDK.
+      shm_hugepage_advise: true
+      posix_io_engine: "psync"
+      io_direct: true
+      shm_partition_enable: false
+
+use_layerwise: false
+mla_using_d2d: false

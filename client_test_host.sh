@@ -2,7 +2,7 @@
 # client_test_host.sh — client_test.sh 的宿主机（裸机）适配版
 #
 # 与 pod 版 client_test.sh 的差异：
-#   1. 环境自动加载（~/ucm-serve-env.sh：CANN + conda vllm-ucm）
+#   1. 环境自动加载（~/ucm-serve-env-023.sh：CANN 9.1.0 + conda vllm-ucm-023）
 #      —— trace_replay.py 会 import vllm/torch_npu，没有 CANN 环境直接失败
 #   2. 修复 pod 专属命令：apt-get → yum（openEuler），且绘图依赖改为 best-effort
 #   3. 大 JSON payload 落盘为文件再 curl --data @file
@@ -12,7 +12,7 @@
 #   5. trace 默认使用 ~/downloads/traces/synthetic_trace_64k.jsonl（Mooncake，原 pod 同款）；
 #      因 trace_replay 按原始时间戳 pacing，默认切前 REPLAY_WINDOW_SEC=120 秒
 #      （约 425 请求 / 5.4M token），REPLAY_WINDOW_SEC=0 可全量回放（3946 请求 / 1022s 跨度）；
-#      切片与回放缓存隔离在 $TRACE_DIR/work/，不动源 trace；超长请求（>64000 tok）自动过滤
+#      切片与回放缓存隔离在 $TRACE_DIR/work/，不动源 trace；超长请求校验失败时退出，不自动过滤
 #   6. 修正 pod 硬编码路径（BENCHMARK_PATH / /workspace-genet/...）
 #      —— vllm 源码安装后 vllm.benchmarks 直接可用，BENCHMARK_PATH 不再需要
 #   7. 增加：服务健康检查（/health）、结果摘要提取、set -euo pipefail
@@ -31,15 +31,19 @@
 #   REPLAY_WINDOW_SEC=300 ./client_test_host.sh --replay-only    # 前 5 分钟窗口
 #   REPLAY_WINDOW_SEC=0 ./client_test_host.sh --replay-only      # 全量回放
 #   TRACE_FILE=~/downloads/traces/conversation_trace_64k.jsonl ./client_test_host.sh
+#   MAX_INPUT_LEN=4096 ./client_test_host.sh --replay-only
+#   MAX_INPUT_LEN=0 means no extra input cap; the server context limit still applies.
 
 # ---------------- 可调参数 ----------------
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-7780}"
-MODEL="${MODEL:-/mnt/model/DeepSeek-V2-Lite-Chat}"
+# MODEL="${MODEL:-/mnt/model/DeepSeek-V2-Lite-Chat}"
+MODEL="${MODEL:-/mnt/model/DeepSeek-V4-Flash-w8a8-mtp}"
 REPO="$HOME/devA2/unified-cache-management"
 TRACE_DIR="${TRACE_DIR:-$HOME/downloads/traces}"              # Mooncake trace 目录
-TRACE_FILE="${TRACE_FILE:-$TRACE_DIR/synthetic_trace_64k.jsonl}"  # 原 pod 脚本同款 trace
-MAX_CONCURRENCY="${MAX_CONCURRENCY:-20}"
+TRACE_FILE="${TRACE_FILE:-$TRACE_DIR/syfi_coding_large_64k_replay.jsonl}"  # 自选agentic trace
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-8}"
+MAX_INPUT_LEN="${MAX_INPUT_LEN:-0}"  # Token cap for trace inputs; 0 follows server limits only.
 # REPLAY_WINDOW_SEC=0 表示全量回放
 REPLAY_WINDOW_SEC="${REPLAY_WINDOW_SEC:-0}"
 # 合成 trace 参数（仅在 TRACE_FILE 不存在时兜底生成）
@@ -67,7 +71,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------- 环境加载 ----------------
-source "$HOME/ucm-serve-env.sh"   # CANN(~/ascend) + conda(vllm-ucm)
+source "$HOME/ucm-serve-env-023.sh" || exit 1    # Match the server's CANN / vLLM environment.
 cd "$REPO"
 
 set -euo pipefail
@@ -166,7 +170,18 @@ for i in $(seq 1 60); do
   fi
   sleep 5
 done
-echo "    served model: $(curl -s "http://$HOST:$PORT/v1/models" | jq -r '.data[0].id' 2>/dev/null || echo '?')"
+MODELS_JSON=$(curl -fsS --max-time 10 "http://$HOST:$PORT/v1/models")
+SERVER_MAX_MODEL_LEN=$(jq -er --arg model "$MODEL" \
+  '.data[] | select(.id == $model) | .max_model_len | select(type == "number" and . > 0)' <<< "$MODELS_JSON") || {
+  echo "ERROR: 无法获取模型 $MODEL 的服务端长度上限，请检查 /v1/models" >&2
+  exit 1
+}
+echo "    served model: $MODEL | max_model_len=$SERVER_MAX_MODEL_LEN"
+if [[ ! "$MAX_INPUT_LEN" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "ERROR: MAX_INPUT_LEN 必须为非负整数（0 表示不额外限制输入长度）" >&2
+  exit 1
+fi
+echo "    trace input cap: MAX_INPUT_LEN=$MAX_INPUT_LEN (0 = server limit only)"
 
 # ---------------- 冒烟测试：同一请求发两次，观察 cache 命中 ----------------
 if [[ "$SMOKE" == "1" ]]; then
@@ -244,30 +259,41 @@ with open(path, "w") as f:
 print(f"    已生成 {n_req} 个请求：input={in_len}, output={out_len}, "
       f"共享前缀 {shared * 512} token / {shared}/{blocks} 块")
 PY
-    REPLAY_TRACE="$TRACE_FILE"
   else
     echo "    源 trace: $TRACE_FILE ($(wc -l < "$TRACE_FILE") 行)"
-    # 按时间窗切片到 work 目录（重放产物/缓存均隔离在 work 内，不污染源 trace）
-    WORK_DIR="$TRACE_DIR/work"
-    mkdir -p "$WORK_DIR"
-    if [[ "$REPLAY_WINDOW_SEC" == "0" ]]; then
-      REPLAY_TRACE="$TRACE_FILE"
-      echo "    REPLAY_WINDOW_SEC=0 → 全量回放（注意时间跨度与总量）"
-    else
-      REPLAY_TRACE="$WORK_DIR/$(basename "$TRACE_FILE" .jsonl)_w${REPLAY_WINDOW_SEC}s.jsonl"
-      python - "$TRACE_FILE" "$REPLAY_TRACE" "$REPLAY_WINDOW_SEC" <<'PY'
+  fi
+
+  # Select only an explicitly requested time window; validate lengths without dropping requests.
+  WORK_DIR="$TRACE_DIR/work"
+  mkdir -p "$WORK_DIR"
+  REPLAY_TRACE="$WORK_DIR/$(basename "$TRACE_FILE" .jsonl)_w${REPLAY_WINDOW_SEC}s.jsonl"
+  python - "$TRACE_FILE" "$REPLAY_TRACE" "$REPLAY_WINDOW_SEC" "$SERVER_MAX_MODEL_LEN" "$MAX_INPUT_LEN" <<'PY'
 import json, sys
 
-src, dst, win = sys.argv[1], sys.argv[2], int(sys.argv[3])
+src, dst = sys.argv[1:3]
+win, max_len, max_input_len = map(int, sys.argv[3:6])
+if win < 0:
+    raise SystemExit("REPLAY_WINDOW_SEC must be nonnegative")
 reqs = [json.loads(l) for l in open(src)]
+if not reqs:
+    raise SystemExit("ERROR: trace is empty")
 t0 = min(r["timestamp"] for r in reqs)
-kept, dropped = [], 0
-for r in reqs:
-    if r["input_length"] + r["output_length"] > 64000:   # 服务端 --max-model-len 65536
-        dropped += 1
-        continue
-    if r["timestamp"] - t0 <= win * 1000:
-        kept.append(r)
+kept = [r for r in reqs if not win or r["timestamp"] - t0 <= win * 1000]
+if not kept:
+    raise SystemExit("ERROR: requested time window is empty")
+input_exceeded = sum(bool(max_input_len and r["input_length"] > max_input_len) for r in kept)
+# Leave a small margin for special tokens and text re-tokenization.
+total_exceeded = sum(r["input_length"] + r["output_length"] > max_len - 32 for r in kept)
+if input_exceeded or total_exceeded:
+    largest_input = max(r["input_length"] for r in kept)
+    largest_total = max(r["input_length"] + r["output_length"] for r in kept)
+    raise SystemExit(
+        f"ERROR: trace length validation failed; no requests were filtered or truncated. "
+        f"input violations={input_exceeded} (MAX_INPUT_LEN={max_input_len}, 0=unlimited), "
+        f"context violations={total_exceeded} (server={max_len}, margin=32). "
+        f"Maximum input={largest_input}, input+output={largest_total}. "
+        "Increase the limits or explicitly choose another trace."
+    )
 with open(dst, "w") as f:
     for r in kept:
         f.write(json.dumps(r) + "\n")
@@ -275,11 +301,9 @@ tot = sum(r["input_length"] for r in kept)
 ids = [h for r in kept for h in r["hash_ids"]]
 uniq = len(set(ids))
 reuse = (len(ids) - uniq) / len(ids) * 100 if ids else 0.0
-print(f"    切片: {len(kept)} 请求（过滤超长 {dropped}）"
-      f"总输入 {tot/1e6:.1f}M tok | 窗口内块复用率 {reuse:.1f}%")
+print(f"    长度校验通过: {len(kept)} 请求（时间窗外 {len(reqs) - len(kept)}，未按长度过滤）"
+      f"总输入 {tot/1e6:.1f}M tok | 窗口内块复用率 {reuse:.1f}% | 上限 {max_len}")
 PY
-    fi
-  fi
 
   # prompts 缓存复用（trace_replay: <trace名>_dataset.jsonl 存在则直接加载，跳过 prompt 生成）
   # 策略：同模型 + 同 trace 内容 → 复用；换模型（tokenizer 变）或 trace 内容变更 → 清理重建
@@ -287,17 +311,23 @@ PY
   #       trace_replay 原子写 + 此处行数校验，防止中断遗留的半截/陈旧缓存被误用）
   #       强制全清：FORCE_CLEAN=1
   RDIR=$(dirname "$REPLAY_TRACE")
-  MARKER="$RDIR/.cache_marker"
+  DATASET="$RDIR/$(basename "$REPLAY_TRACE" | cut -d. -f1)_dataset.jsonl"
+  MARKER="${DATASET}.cache_marker"
   CUR_KEY="$MODEL|$(basename "$REPLAY_TRACE")|$(md5sum "$REPLAY_TRACE" 2>/dev/null | cut -d' ' -f1)"
   if [[ "${FORCE_CLEAN:-0}" == "1" ]]; then
-    rm -f "$RDIR"/*_dataset.jsonl "$MARKER" 2>/dev/null || true
-    echo "    FORCE_CLEAN=1 → 已清理 prompts 缓存"
-  elif [[ -f "$MARKER" ]] && [[ "$(cat "$MARKER" 2>/dev/null)" == "$CUR_KEY" ]]; then
+    rm -f "$DATASET" "$MARKER"
+    echo "    FORCE_CLEAN=1 → 已清理当前 trace 的 prompts 缓存"
+  elif [[ -f "$MARKER" && -f "$DATASET" ]] && \
+       [[ "$(cat "$MARKER" 2>/dev/null)" == "$CUR_KEY" ]] && \
+       [[ "$(wc -l < "$DATASET")" -eq "$(wc -l < "$REPLAY_TRACE")" ]]; then
     echo "    同模型同 trace → 复用 prompts 缓存（$(basename "$REPLAY_TRACE" .jsonl)_dataset.jsonl）"
   else
-    rm -f "$RDIR"/*_dataset.jsonl "$MARKER" 2>/dev/null || true
-    echo "    模型/trace 变更 → 已清理旧 prompts 缓存"
+    rm -f "$DATASET" "$MARKER"
+    echo "    当前 dataset 缺失、未验证或模型/trace 变更 → 重新生成 prompts"
   fi
+  # Publish identity before replay: atomic dataset generation and row-count checks
+  # make completed prompts reusable even if the benchmark is interrupted.
+  printf '%s\n' "$CUR_KEY" > "$MARKER"
 
   # trace_replay 用 ExcelWriter mode="a" 追加保存结果，要求 metrics.xlsx 已存在（不存在会崩在最后保存）
   # 兜底：缺失时用 openpyxl 创建一个合法的空工作簿
@@ -321,13 +351,6 @@ PY
     echo "    WARN: trace_replay 异常退出（benchmark 输出已打印，Excel 可能未保存）" >&2
   fi
 
-  # prompts 缓存与压测成败解耦：生成阶段先于回放、已原子落盘，
-  # 只要 dataset 存在且行数与 trace 请求数一致即写复用标记 —— 压测失败下次直接复用
-  DATASET="$RDIR/$(basename "$REPLAY_TRACE" | cut -d. -f1)_dataset.jsonl"
-  if [[ -f "$DATASET" ]] && \
-     [[ "$(wc -l < "$DATASET")" -eq "$(wc -l < "$REPLAY_TRACE")" ]]; then
-    echo "$CUR_KEY" > "$MARKER"
-  fi
   echo "    验证 cache 效果：对比两个 trace 周期的 TTFT（第二周期应显著下降），"
   echo "    或查看服务端日志 grep 'hit external' ~/ucm-logs/$PORT/ucm-*.log"
 fi

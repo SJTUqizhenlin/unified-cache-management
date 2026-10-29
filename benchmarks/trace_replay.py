@@ -536,15 +536,21 @@ async def replay_trace_by_time(
         extra_body={"temperature": 0.9},
     )
 
-    test_output = await request_func(request_func_input=test_input, session=session)
-
-    if not getattr(test_output, "success", False):
-        raise ValueError(
-            "Initial test run failed - Please make sure arguments "
-            f"are correctly specified. Error: {getattr(test_output, 'error', '')}"
-        )
-    else:
-        print("Initial test run completed. Starting main run...")
+    try:
+        test_output = await request_func(request_func_input=test_input, session=session)
+        if not getattr(test_output, "success", False):
+            raise ValueError(
+                "Initial test run failed - Check the served model and server "
+                "max_model_len against the request. "
+                f"prompt_tokens={test_request.prompt_len}, "
+                f"output_tokens={test_request.expected_output_len}. "
+                f"Error: {getattr(test_output, 'error', '')}"
+            )
+    except BaseException:
+        if session is not None:
+            await session.close()
+        raise
+    print("Initial test run completed. Starting main run...")
 
     total = sum(len(req_list) for req_list in req_groups.values())
     pbar = None if disable_tqdm else tqdm(total=total)

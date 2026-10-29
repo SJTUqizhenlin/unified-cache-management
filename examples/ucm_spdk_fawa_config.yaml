@@ -1,0 +1,26 @@
+# DeepSeek V4 FAWA: one connector creates two independently indexed SPDK stores.
+# Replace the endpoint with your NVMe-oF target. Do not overlap other data pools.
+# 500 GiB TOTAL data: FA=250 GiB at offset 0, WA=250 GiB at offset 252.
+# Reserve [0, 504) GiB, including metadata and alignment space.
+# First initialize a NEW/unused pair of regions with spdk_format: 1, then use 0
+# to recover them. Formatting destroys existing metadata; geometry changes can
+# also reset a region. Never reuse an old single-store region without migration.
+
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "Cache|Spdk"
+      # Used by the local launcher; SPDK data itself lives on the raw namespace.
+      storage_backends: "/home/qizhenlin/ucm-cache/test"
+      spdk_trid: "trtype:RDMA adrfam:IPv4 traddr:192.168.1.12 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:c1"
+      spdk_capacity_gb: 500
+      spdk_offset_gib: 0
+      spdk_format: 0
+      spdk_gc_enable: true
+      cache_buffer_capacity_gb: 100
+      share_buffer_enable: true
+      shm_hugepage_advise: true
+      shm_partition_enable: false
+
+use_layerwise: false
+mla_using_d2d: false

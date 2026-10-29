@@ -449,6 +449,16 @@ _CONNECTOR_INTERFACE_DURATION_BUCKETS = [
 ]
 _HISTOGRAM_METRICS = [
     (
+        "fawa_start_load_kv_duration_ms",
+        "FAWA per-worker per-forward total load entry wall-clock duration for nonempty submitted tasks, including wait failures (ms); includes metadata, pointer preparation, submission and residual wait",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
+        "fawa_load_wait_duration_ms",
+        "FAWA per-worker per-forward residual load barrier wall-clock duration for nonempty tasks, including failures (ms); not task submit latency",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+    ),
+    (
         "save_duration",
         "Time from UCM connector wait_for_save entry to async dump task completion (ms)",
         [0, 50, 100, 150, 200, 250, 300, 350, 400, 550, 600, 750, 800, 850, 900, 950, 1000],

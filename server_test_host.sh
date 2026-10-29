@@ -2,7 +2,7 @@
 # server_test_host.sh — server_test.sh 的宿主机（裸机）适配版
 #
 # 与 pod 版 server_test.sh 的差异：
-#   1. 自动加载宿主机环境：CANN(~/ascend) + conda(vllm-ucm) + ENABLE_UCM_PATCH
+#   1. 自动加载宿主机环境：CANN 9.1.0 + conda(vllm-ucm-023) + ENABLE_UCM_PATCH
 #   2. 移除每次启动的 `pip install -e .`：UCM 已 editable 安装，改代码即时生效
 #   3. 缓存目录改为当前用户私有目录（默认 ~/ucm-cache/test），不再使用共享的 /mnt/test
 #   4. 破坏性操作前置安全检查：
@@ -24,8 +24,9 @@
 # ---------------- 可调参数 ----------------
 UCM_ENABLED=1
 CACHE_DIR="${CACHE_DIR:-$HOME/ucm-cache/test}"
-MODEL="${MODEL:-/mnt/model/DeepSeek-V2-Lite-Chat}"
-DEVICES="${DEVICES:-4,5,6,7}"
+# MODEL="${MODEL:-/mnt/model/DeepSeek-V2-Lite-Chat}"
+MODEL="${MODEL:-/mnt/model/DeepSeek-V4-Flash-w8a8-mtp}"
+DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
 PORT="${PORT:-7780}"
 REPO="$HOME/devA2/unified-cache-management"
 # 配置文件放在缓存目录外（避免被清空逻辑误删），按缓存目录名隔离
@@ -67,10 +68,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---------------- 环境加载（在 set -e 之前，避免 CANN set_env 的非零返回干扰） ----------------
-source "$HOME/ucm-serve-env.sh"                 # CANN(~/ascend) + conda(vllm-ucm) + ENABLE_UCM_PATCH=1
+source "$HOME/ucm-serve-env-023.sh" || exit 1    # CANN 9.1.0 + vLLM/Ascend 0.23
 export ENABLE_UCM_PATCH="$UCM_ENABLED"          # 覆盖 env 文件默认值，支持 --ucm off
 export PLATFORM=ascend
-export ASCEND_ROOT="$HOME/ascend/ascend-toolkit/latest"   # UCM 定位 CANN（宿主机非默认路径）
+export ASCEND_ROOT="$ASCEND_TOOLKIT_HOME"       # Follow the selected CANN, never override with the old path.
 export SPDK_ROOT_DIR="${SPDK_ROOT_DIR:-$HOME/devSPDK/spdk}"  # spdkstore 后端定位 SPDK
 export ASCEND_RT_VISIBLE_DEVICES="$DEVICES"
 export UCM_LOG_PATH="$HOME/ucm-logs/$PORT"
@@ -291,10 +292,29 @@ echo " devices: $DEVICES (TP=$TP) | port: $PORT"
 echo " cache: ${CACHE_DIR:-(ucm off)} | UCM log: $UCM_LOG_PATH"
 echo "==================================================================="
 
+MODEL_ARGS=()
+DEFAULT_MAX_MODEL_LEN=65536
+# if [[ "$(basename "${MODEL%/}")" == DeepSeek-V4-Flash* ]]; then
+#   # Start V4 with a bounded profiling workload before testing long contexts.
+#   DEFAULT_MAX_MODEL_LEN=8192
+#   MODEL_ARGS+=(--enable-expert-parallel
+#     --max-num-seqs "${MAX_NUM_SEQS:-4}"
+#     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}")
+#   if [[ "$UCM_ENABLED" == "1" ]]; then
+#     MODEL_ARGS+=(--enable-prefix-caching)
+#   else
+#     MODEL_ARGS+=(--no-enable-prefix-caching)
+#   fi
+# else
+#   MODEL_ARGS+=(--enable-prefix-caching)
+# fi
+
+echo " limits: max_model_len=${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN} gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9} model_args=${MODEL_ARGS[*]}"
+
 exec vllm serve "$MODEL" \
   --served-model-name "$MODEL" \
-  --max-model-len 65536 \
-  --tensor-parallel-size "$TP" --gpu_memory_utilization 0.9 \
+  --max-model-len "${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN}" \
+  --tensor-parallel-size "$TP" --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION:-0.9}" \
   --block_size 128 --trust-remote-code --port "$PORT" --enforce-eager \
-  --enable-prefix-caching \
+  "${MODEL_ARGS[@]}" \
   "${UCM_ARGS[@]}"

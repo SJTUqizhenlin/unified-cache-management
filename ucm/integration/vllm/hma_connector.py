@@ -1,6 +1,7 @@
 import copy
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
@@ -627,7 +628,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         self,
         store_suffix: str,
     ) -> tuple[str, Optional[str], dict[str, object]]:
-        """Build a namespaced UCM store config for either FA or WA data."""
+        """Build a namespaced UCM store config for either FA or WA data.
+
+        Only FAWA's Cache|Spdk pipeline treats spdk_capacity_gb as a TOTAL
+        data budget (default 500 GiB), not a per-instance capacity. FA gets
+        floor(total / 2), WA gets the remainder. Each region reserves another
+        2 GiB for the engine's one-sector superblock and 1 GiB index, so reserve
+        total + 4 GiB on the namespace starting at spdk_offset_gib (default 0).
+        Offsets depend only on config, never worker/scheduler block geometry.
+        Existing on-disk pools must be migrated or reformatted for this layout.
+        """
 
         if len(self.connector_configs) != 1:
             raise RuntimeError(
@@ -640,6 +650,43 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         module_path = self.connector_configs[0].get("ucm_connector_module_path", None)
         config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
         config.setdefault("store_pipeline", "Cache|Empty")
+        if config["store_pipeline"] == "Cache|Spdk":
+            values = []
+            for key, default, minimum in (
+                ("spdk_capacity_gb", 500, 2),
+                ("spdk_offset_gib", 0, 0),
+            ):
+                value = config.get(key, default)
+                try:
+                    if isinstance(value, bool) or not isinstance(value, (int, str)):
+                        raise ValueError
+                    value = int(value)
+                    if value < minimum:
+                        raise ValueError
+                except ValueError:
+                    raise ValueError(
+                        f"FAWA {key} must be an integer >= {minimum}, "
+                        f"got {config.get(key, default)!r}."
+                    ) from None
+                values.append(value)
+            total, base = values
+            fa_capacity = total // 2
+            config["spdk_capacity_gb"] = (
+                fa_capacity if store_suffix == "fa" else total - fa_capacity
+            )
+            # C++ floors the slot count to the data target. Rounding the full
+            # region (data + 1 GiB index + one sector) to GiB adds 2 GiB.
+            config["spdk_offset_gib"] = (
+                base if store_suffix == "fa" else base + fa_capacity + 2
+            )
+            logger.info(
+                f"FAWA {store_suffix} SPDK partition: "
+                f"offset={config['spdk_offset_gib']} GiB, "
+                f"data_capacity={config['spdk_capacity_gb']} GiB "
+                f"from TOTAL {total} GiB (default 500), "
+                f"plus 2 GiB region overhead; reserve [{base}, "
+                f"{base + total + 4}) GiB across FA/WA on the namespace."
+            )
         # MLA ranks share one logical store buffer; non-MLA stores are per rank.
         config.setdefault("share_buffer_enable", self.is_mla)
         if isinstance(config.get("storage_backends"), str):
@@ -1299,6 +1346,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         return all_group_vllm_block_ids
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        load_start = time.perf_counter()
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
             raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
@@ -1351,15 +1399,32 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 )
                 self._handle_load_err(request_id)
 
-        self._wait_all_load_task(tasks)
+        try:
+            self._wait_all_load_task(tasks)
+        finally:
+            if tasks:
+                ucmmetrics.update_stats(
+                    {"fawa_start_load_kv_duration_ms": (time.perf_counter() - load_start) * 1000}
+                )
 
     def _wait_all_load_task(self, tasks: list[FAWALoadTask]):
-        load_bytes = 0
-        for load_task in tasks:
-            if self._wait_load_task(load_task):
-                load_bytes += load_task.key_count * self.file_size[load_task.label]
-        if tasks:
+        if not tasks:
+            return
+        wait_start = time.perf_counter()
+        try:
+            load_bytes = 0
+            for load_task in tasks:
+                if self._wait_load_task(load_task):
+                    load_bytes += load_task.key_count * self.file_size[load_task.label]
             ucmmetrics.update_stats({"load_bytes_total": load_bytes})
+        finally:
+            ucmmetrics.update_stats(
+                {
+                    "fawa_load_wait_duration_ms": (
+                        time.perf_counter() - wait_start
+                    ) * 1000
+                }
+            )
 
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()

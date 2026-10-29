@@ -9,6 +9,8 @@
 #
 # 用法：
 #   ./ucm_store_stats.sh                     # 快照模式：立即输出三层全景
+#   ./ucm_store_stats.sh snapshot -i 5 -n 10 # 每 5s 输出完整快照，共 10 次
+#   ./ucm_store_stats.sh snapshot -i 5       # 持续完整快照，Ctrl+C 停止
 #   ./ucm_store_stats.sh watch               # 监视模式：每 10s 输出一行增量
 #   ./ucm_store_stats.sh watch -i 5 -n 60    # 每 5s 一次，共 60 次
 #   ./ucm_store_stats.sh probe [-t 10]       # strace 采样文件 IO：psync→pwrite64/pread64，
@@ -17,6 +19,7 @@
 # 环境变量覆盖：
 #   HOST=127.0.0.1  PORT=7780  CACHE_DIR=~/ucm-cache/test
 #   STORE_BACKEND=auto|posix|spdk  UCM_CONFIG=/path/to/config.yaml
+#   STATS_ALL_PROCESSES=1  包含日志、resource tracker、编译等辅助子进程（默认仅 EngineCore/Worker）
 #   SPDK_RPC=/path/to/rpc.py  SPDK_RPC_SOCKET=/var/tmp/spdk.sock
 #   SPDK_BDEV=Nvme0n1  SPDK_RPC_SUDO=1 (default; noninteractive sudo)
 #   SPDK probe uses read-only RPC deltas, not strace. No counters are reset.
@@ -24,6 +27,9 @@
 #
 # 提示：metrics 为累计值；窗口分析用 watch 模式（自动做差分）。
 #       指标在有推理请求时才被 vllm 同步到 /metrics，空闲期数值不动是正常现象。
+#       FAWA load barrier 显示非空加载屏障的累计 avg/p99（跨 rank 合并，非 NPU 空闲时长）；
+#       watch 中该时延仍为累计值，p99 为 histogram 插值估算，超过最大桶只显示下界。
+#       start_load_kv total 包含全部 hook 调用（含无 Load），与 FAWA 非空屏障样本集合不同。
 #       注意 /proc 的 syscw 含大量与 UCM 无关的后台小写入（各 worker ~3k/s 的 8B IPC 写），
 #       文件写次数请以 probe 模式或 UC_DEBUG 日志的 task_count 为准。
 #       aio 引擎注意：libaio(io_submit) 不计入 /proc/<pid>/io（wchar/syscw 对 UCM IO 失明），
@@ -38,6 +44,7 @@ URL="http://$HOST:$PORT/metrics"
 MODE="snapshot"
 INTERVAL=10
 MAX_CYCLES=0
+REPEAT_SNAPSHOT=0
 PROBE_SEC=10
 
 while [[ $# -gt 0 ]]; do
@@ -45,14 +52,21 @@ while [[ $# -gt 0 ]]; do
     snapshot)  MODE="snapshot" ;;
     watch)     MODE="watch" ;;
     probe)     MODE="probe" ;;
-    -i)        INTERVAL="$2"; shift ;;
-    -n)        MAX_CYCLES="$2"; shift ;;
+    -i)        [[ $# -ge 2 ]] || { echo "ERROR: -i requires seconds" >&2; exit 2; }; INTERVAL="$2"; REPEAT_SNAPSHOT=1; shift ;;
+    -n)        [[ $# -ge 2 ]] || { echo "ERROR: -n requires a count" >&2; exit 2; }; MAX_CYCLES="$2"; REPEAT_SNAPSHOT=1; shift ;;
     -t)        PROBE_SEC="$2"; shift ;;
     -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)         echo "未知参数: $1（支持: snapshot | watch [-i 秒] [-n 次] | probe [-t 秒]）" >&2; exit 2 ;;
   esac
   shift
 done
+if [[ ! "$INTERVAL" =~ ^[1-9][0-9]*$ || ! "$MAX_CYCLES" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "ERROR: -i must be a positive integer; -n must be a nonnegative integer (0 = unlimited)" >&2
+  exit 2
+fi
+if [[ "$MODE" == "snapshot" && "$REPEAT_SNAPSHOT" == "0" ]]; then
+  MAX_CYCLES=1
+fi
 
 # ---------------- 工具函数 ----------------
 fmt_bytes() {  # 字节 → 人类可读（十进制 GB，与 metrics 口径一致）
@@ -160,10 +174,12 @@ collect() {
 
 # ---------------- 进程发现（master → EngineCore → workers） ----------------
 declare -a PIDS=()
+HIDDEN_PROCESS_COUNT=0
 discover_pids() {
   local master="" p cl
   MASTER_PID=""
   PIDS=()
+  HIDDEN_PROCESS_COUNT=0
   [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" ]] || return 0
   for p in $(pgrep -f "vllm serve" 2>/dev/null); do
     [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == "vllm" ]] || continue
@@ -171,16 +187,23 @@ discover_pids() {
     if [[ "$cl" == *"--port $PORT"* ]]; then master=$p; break; fi
   done
   [[ -z "$master" ]] && return 0
-  # BFS 收集子孙进程（最多 4 层）
-  local -a queue=("$master") visited=("$master")
-  local depth=0 maxnodes=64
-  while ((${#queue[@]} > 0 && depth < 4 && ${#PIDS[@]} < maxnodes)); do
+  # Traverse helpers too: a relevant worker can be below an intermediary process.
+  local -a queue=("$master")
+  local depth=0
+  local comm
+  while ((${#queue[@]} > 0 && depth < 4)); do
     local -a next=()
     for p in "${queue[@]}"; do
       local c
       while read -r c; do
         [[ -z "$c" ]] && continue
-        PIDS+=("$c"); next+=("$c")
+        next+=("$c")
+        comm=$(cat "/proc/$c/comm" 2>/dev/null) || continue
+        if [[ "${STATS_ALL_PROCESSES:-0}" == "1" || "$comm" == VLLM::EngineCor* || "$comm" == VLLM::Worker* ]]; then
+          PIDS+=("$c")
+        else
+          ((HIDDEN_PROCESS_COUNT++))
+        fi
       done < <(ps -o pid= --ppid "$p" 2>/dev/null)
     done
     queue=("${next[@]:-}")
@@ -211,6 +234,7 @@ snapshot() {
       (( maxw < 1000000000 )) && aio=1
     fi
     echo "── [逻辑层] metrics（累计值）"
+    python "$(dirname "${BASH_SOURCE[0]}")/scripts/ucm_metric_summary.py" "$METRICS"
     echo "  Posix 写(host→SSD) : $(fmt_bytes "${V[m.h2s]}")    读(SSD→host): $(fmt_bytes "${V[m.s2h]}")"
     echo "    写 per-rank: $(mrank ucm:posix_h2s_bytes_total "$METRICS" | cut -c1-200)"
     echo "    读 per-rank: $(mrank ucm:posix_s2h_bytes_total "$METRICS" | cut -c1-200)"
@@ -235,7 +259,12 @@ snapshot() {
     echo
   fi
 
-  echo "── [syscall层] /proc/<pid>/io（vllm 进程树，按写入排序）"
+  if [[ "${STATS_ALL_PROCESSES:-0}" == "1" ]]; then
+    echo "── [syscall层] /proc/<pid>/io（完整子进程树，按写入排序）"
+  else
+    echo "── [syscall层] /proc/<pid>/io（仅 EngineCore/Worker，按写入排序）"
+    echo "  已隐藏辅助进程 $HIDDEN_PROCESS_COUNT 个；STATS_ALL_PROCESSES=1 可显示全部"
+  fi
   if [[ "$aio" == "1" ]]; then
     echo "  ⚠ aio 引擎：io_submit 不计入 /proc io，下表仅 IPC 背景流量，UCM 文件 IO 不可见"
     echo "    （dump worker 识别失效；文件 IO 尺寸/次数请用 probe 模式，自动切 io_submit 口径）"
@@ -248,13 +277,13 @@ snapshot() {
       comm=$(cat "/proc/$p/comm" 2>/dev/null || echo '?')
       mark=""
       # 标记 dump worker（wchar 显著大于其它进程）
-      [[ "$wc" -gt 1073741824 ]] && mark="  ← dump worker"
+      [[ "$comm" == VLLM::Worker* && "$wc" -gt 1073741824 ]] && mark="  ← possible dump worker"
       printf "  %-10s %-18s %-18s %-12s %-18s %-12s%s\n" "$p" "${comm:0:17}" "$(fmt_bytes "$wc")" "$(fmt_cnt "$sc")" "$(fmt_bytes "$rc")" "$(fmt_cnt "$rcr")" "$mark"
     done < <(for p in "${PIDS[@]}"; do
         io=$(cat "/proc/$p/io" 2>/dev/null) || continue
         awk -v p="$p" '/^wchar:/{w=$2}/^syscw:/{sw=$2}/^rchar:/{r=$2}/^syscr:/{sr=$2}END{print p, w+0, sw+0, r+0, sr+0}' <<<"$io"
       done | sort -k2 -rn)
-    echo "  （注意：syscw 含各 worker ~3k/s 的后台小写入，≠ 文件写次数；文件写用 probe 模式测）"
+    echo "  （进程启动以来的逻辑 syscall 累计值，含权重加载/IPC/日志，≠ KV 或物理磁盘 IO；文件写用 probe 模式测）"
     echo
   else
     echo "  ✗ 未找到 vllm serve 进程"
@@ -301,6 +330,7 @@ watch() {
       # 基线时锁定 dump worker 的 syscw 基数
       local bp="" bwv=-1
       for p in "${PIDS[@]:-}"; do
+        [[ "$(cat "/proc/$p/comm" 2>/dev/null)" == VLLM::Worker* ]] || continue
         w="${PREV[p.$p.wchar]:-0}"
         if (( w > bwv )); then bwv=$w; bp=$p; fi
       done
@@ -311,6 +341,7 @@ watch() {
       # 定位 dump worker（wchar 最大的进程）
       local toppid="" topw=-1 p w
       for p in "${PIDS[@]:-}"; do
+        [[ "$(cat "/proc/$p/comm" 2>/dev/null)" == VLLM::Worker* ]] || continue
         w="${PREV[p.$p.wchar]:-0}"
         if (( w > topw )); then topw=$w; toppid=$p; fi
       done
@@ -344,6 +375,8 @@ watch() {
       LAST_FC="${PREV[f.count]:-0}"
       [[ -n "$toppid" ]] && LAST_SW="${PREV[p.$toppid.syscw]:-0}"
     fi
+    # Barrier latencies remain cumulative, unlike the byte deltas above.
+    python "$(dirname "${BASH_SOURCE[0]}")/scripts/ucm_metric_summary.py" "$METRICS"
     LAST_T=$(date +%s.%N)
     ((cycle++))
     if [[ "$MAX_CYCLES" -gt 0 && "$cycle" -ge "$MAX_CYCLES" ]]; then
@@ -383,6 +416,7 @@ probe() {
   else
     local toppid="" topw=-1
     for p in "${PIDS[@]:-}"; do
+      [[ "$(cat "/proc/$p/comm" 2>/dev/null)" == VLLM::Worker* ]] || continue
       io=$(cat "/proc/$p/io" 2>/dev/null) || continue
       w=$(awk '/^wchar:/{print $2}' <<<"$io")
       if (( w+0 > topw )); then topw=$w; toppid=$p; fi
@@ -517,5 +551,13 @@ esac
 case "$MODE" in
   watch)     watch ;;
   probe)     probe ;;
-  *)         snapshot ;;
+   *)
+     cycle=0
+     while :; do
+       discover_pids
+       snapshot
+       ((cycle++))
+       if (( MAX_CYCLES > 0 && cycle >= MAX_CYCLES )); then break; fi
+       sleep "$INTERVAL"
+     done ;;
 esac

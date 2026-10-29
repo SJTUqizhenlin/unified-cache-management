@@ -4,6 +4,38 @@
  */
 
 #include <stdint.h>
+#include "ucm_spdk_engine.h"
+
+struct spdk_store_engine *store_engine_create(void);
+struct spdk_store_engine *store_engine_select(struct spdk_store_engine *engine);
+void store_engine_destroy(struct spdk_store_engine *engine);
+int store_engine_set_direct_only(int enabled);
+
+int spdk_store_set_direct_only(int enabled)
+{
+	return store_engine_set_direct_only(enabled);
+}
+
+struct spdk_store_engine *spdk_store_engine_create(void)
+{
+	return store_engine_create();
+}
+
+struct spdk_store_engine *spdk_store_engine_select(struct spdk_store_engine *engine)
+{
+	return store_engine_select(engine);
+}
+
+int store_engine_set_cpu_affinity(const int *cores, uint32_t count);
+int spdk_store_set_cpu_affinity(const int *cores, uint32_t count)
+{
+	return store_engine_set_cpu_affinity(cores, count);
+}
+
+void spdk_store_engine_destroy(struct spdk_store_engine *engine)
+{
+	store_engine_destroy(engine);
+}
 
 /* from the engine (ucm_spdk_store.c, non-static public functions) */
 int store_engine_init(const char *trid_str, uint32_t nslots_req,
@@ -31,8 +63,8 @@ void store_set_direct_dma(int enable);
 uint64_t store_registered_bytes(void);
 int store_register_memory(void *addr, uint64_t size);
 int store_unregister_memory(void *addr, uint64_t size);
-int reactor_start(void);
-void reactor_stop(void);
+int store_reactor_start_public(void);
+void store_reactor_stop_public(void);
 
 /* engine accessor functions (non-static wrappers in the engine source) */
 uint64_t store_live_count(void);
@@ -87,13 +119,13 @@ spdk_store_lookup_fini(void)
 int
 spdk_store_reactor_start(void)
 {
-	return reactor_start();
+	return store_reactor_start_public();
 }
 
 void
 spdk_store_reactor_stop(void)
 {
-	reactor_stop();
+	store_reactor_stop_public();
 }
 
 int

@@ -30,9 +30,8 @@
  * old mapping intact; between (2) and (3) both records are valid and the
  * higher epoch wins; (4) only affects memory.
  *
- * Data moves through internal DMA bounce buffers (copied in/out); a later
- * UCM integration can register the Cache stage's SHM buffers directly to
- * remove those copies. The poll loop also services the admin qpair
+ * Registered caller buffers use direct DMA. Standalone callers can instead
+ * use a bounded, preallocated bounce pool. The poll loop also services the admin qpair
  * (fabrics keep-alive) and carries a 30s progress watchdog.
  */
 
@@ -62,10 +61,11 @@
 SPDK_LOG_REGISTER_COMPONENT(ucm_spdk_gc)
 
 #define MAX_QD           1024
-#define IO_POOL_BUFS     256     /* shard-sized DMA bounce buffers */
+#define IO_POOL_BUFS     256     /* payload-independent IO tokens */
+#define IO_POOL_BYTES    (64ULL * 1024 * 1024) /* per-store bounce budget */
 #define NUM_IDX_BUFS     64      /* sector-sized index record buffers */
 #define MAX_DUMP_CTX     1024    /* incomplete layerwise blocks per worker */
-#define MAX_LOAD_CTX     16
+#define MAX_LOAD_CTX     128
 #define GC_MAX_PASS      16      /* hard per-pass cap */
 #define NUM_REC_OPS      64      /* in-flight durable invalidations */
 #define MAX_PINV         (MAX_DUMP_CTX + GC_MAX_PASS)
@@ -112,7 +112,7 @@ SPDK_STATIC_ASSERT(sizeof(struct superblock) == 40, "bad layout");
 #define DEFAULT_FORMAT_SLOTS 64
 
 #define SHM_MAGIC        0x55434D5350444B53ULL /* "UCMSPDKS" */
-#define SHM_VERSION      5u
+#define SHM_VERSION      6u
 #define MAX_WORKERS      64
 
 #define GC_ENOSPC_BATCH  4       /* victims per on-demand GC pass */
@@ -120,7 +120,7 @@ SPDK_STATIC_ASSERT(MAX_DUMP_CTX + GC_MAX_PASS <= MAX_PINV,
                    "pending invalidation queue is undersized");
 
 /*
- * The block index (hash table), free list, epoch, hotness and pin arrays
+ * The block index (hash table), free list, epoch, hotness, pin and retirement arrays
  * live in a shared memory segment so that every UCM process sees the
  * same mapping: worker processes commit dumps, the scheduler process
  * only looks up. A process-shared robust mutex serializes writers (and
@@ -144,7 +144,9 @@ SPDK_STATIC_ASSERT(MAX_DUMP_CTX + GC_MAX_PASS <= MAX_PINV,
  * (invalidation record + exact free-list push); -ENOSPC only when GC
  * cannot free anything (all pinned). The Posix GC's expensive parts
  * (directory sampling, stat/mtime sorting, unlink storms) are replaced
- * by an O(1) free counter and shared-memory arrays.
+ * by an O(1) free counter and shared-memory arrays. A durable invalidation
+ * marks its slot retired; the final pin release reclaims it under the shared
+ * mutex. No process-local operation owns a retirement after its IO completes.
  */
 struct shm_header {
 	uint64_t	magic;
@@ -225,7 +227,6 @@ struct load_ctx {
 
 struct rec_op {
 	int		active;
-	int		waiting_pin;
 	uint32_t	slot;
 	int		free_on_done;
 	int		buf;
@@ -238,7 +239,7 @@ struct shard_io {
 	uint32_t	buf;         /* concurrency token index */
 	uint32_t	shard;       /* physical shard index */
 	uint32_t	offset;      /* relative shard index in caller buffer */
-	int		bounce;      /* 1 = data in g_io_bufs[buf], copy on done */
+	int		bounce;      /* bounce buffer index, or -1 for direct DMA */
 };
 
 struct pending_inv {
@@ -322,40 +323,17 @@ struct store_op {
 };
 
 
-static struct spdk_nvme_ctrlr		*g_ctrlr;
-static struct spdk_nvme_ns		*g_ns;
-static struct spdk_nvme_qpair		*g_qpair;
-static struct spdk_nvme_transport_id	g_trid;
+#include "engine_context.h"
 
-static uint32_t	g_sector_size;
-static uint64_t	g_num_sectors;
-static uint32_t	g_shard_sectors;
-static uint32_t	g_slot_sectors;
-static uint32_t	g_nshards;
-static uint32_t	g_nslots;            /* resolved: SB value, or -n (format/resize) */
-static uint32_t	g_index_slots;       /* fixed metadata capacity */
-static uint64_t	g_data_base;         /* superblock LBA */
-static uint64_t	g_index_base;        /* fixed: right after the superblock */
-static uint64_t	g_pool_base;         /* data pool start, after the reservation */
-
-static struct shm_header		*g_shm;
-static uint8_t				*g_shm_base;
-static size_t				g_shm_size;
-static int				g_shm_fd = -1;
-static int				g_lease_fd = -1;
-static int				g_maintenance_fd = -1;
-static int				g_shm_recovery_owner;
-static int				g_shm_recovering;
-static int				g_region_reset;   /* boot invalidated the region */
-static int				g_shm_created;    /* this boot created the segment */
-static pid_t				g_registered_pid;
-static char				g_shm_name[64];
-static char				g_lease_name[64];
-static uint64_t				g_gc_passes;
-static uint64_t				g_gc_evicted;
-static uint32_t				g_layers = 27;
-static uint32_t				g_shard_kb = 144;
-static uint64_t				g_offset_gib;
+/* SPDK's environment is process-wide and cannot be initialized twice with
+ * options. Keep it until process exit, including across failed store boots.
+ * Controller ownership and host registrations are also process resources. */
+static pthread_mutex_t process_mu = PTHREAD_MUTEX_INITIALIZER;
+static int process_env_ready;
+static struct engine_controller *process_controllers;
+static struct spdk_store_engine *process_engines = &default_engine;
+static struct reg_range *process_regs;
+static size_t process_reg_count;
 
 /* Cross-process comparable wall clock (ms) for hotness; works in every
  * role including the device-less lookup process. */
@@ -387,9 +365,25 @@ build_shm_names(void)
 	}
 	snprintf(g_shm_name, sizeof(g_shm_name), "/ucm_spdk_%016" PRIx64, h);
 	snprintf(g_lease_name, sizeof(g_lease_name), "/ucm_spdk_lock_%016" PRIx64, h);
+	snprintf(ENGINE->maintenance_name, sizeof(ENGINE->maintenance_name),
+		 "/ucm_spdk_maintenance_%016" PRIx64, h);
 }
 
-static int g_startup_fd = -1;
+static int
+store_parse_region(const char *trid_str, uint64_t offset_gib)
+{
+	memset(&g_trid, 0, sizeof(g_trid));
+	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
+	snprintf(g_trid.traddr, sizeof(g_trid.traddr), "0000:84:00.0");
+	snprintf(g_trid.subnqn, sizeof(g_trid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
+	if (trid_str != NULL && trid_str[0] != '\0' &&
+	    spdk_nvme_transport_id_parse(&g_trid, trid_str) != 0) {
+		return -EINVAL;
+	}
+	g_offset_gib = offset_gib;
+	build_shm_names();
+	return 0;
+}
 
 static int
 store_maintenance_open(int exclusive)
@@ -399,7 +393,10 @@ store_maintenance_open(int exclusive)
 	if (rc != 0) {
 		return rc;
 	}
-	g_maintenance_fd = shm_open("/ucm_spdk_maintenance_lock", O_CREAT | O_RDWR, 0600);
+	/* Never unlink lock files: live flock holders must keep the same inode.
+	 * The old global maintenance lock is intentionally not reused. Deploy
+	 * this protocol only after all old engine processes have stopped. */
+	g_maintenance_fd = shm_open(ENGINE->maintenance_name, O_CREAT | O_RDWR, 0600);
 	if (g_maintenance_fd < 0) {
 		rc = -errno;
 		store_startup_close(&g_startup_fd);
@@ -504,42 +501,12 @@ store_lease_close(void)
 					g_shm->hash_size))
 #define g_hotness	((uint64_t *)(g_freelist + g_shm->nslots))
 #define g_pins		((uint16_t *)(g_hotness + g_shm->nslots))
+#define g_retired	((uint8_t *)(g_pins + g_shm->nslots))
 #define g_hash_count	(g_shm->hash_count)
 #define g_live_count	(g_shm->live_count)
 #define g_free_top	(g_shm->free_top)
 #define g_epoch		(g_shm->epoch)
-static uint64_t	g_err_count;
-static _Atomic int g_healthy = 1;
-
-static void	**g_io_bufs;
-static uint32_t	g_io_free[IO_POOL_BUFS];
-static uint32_t	g_io_free_top;
-static void	**g_idx_bufs;
-static uint32_t	g_idx_free[NUM_IDX_BUFS];
-static uint32_t	g_idx_free_top;
-
-static struct dump_ctx	g_dctx[MAX_DUMP_CTX];
-static struct load_ctx	g_lctx[MAX_LOAD_CTX];
-static struct rec_op	g_rops[NUM_REC_OPS];
-static struct shard_io	g_sios[IO_POOL_BUFS];
-static struct pending_inv	g_pinv[MAX_PINV];
-static uint32_t	g_pinv_n;
-static uint32_t	g_pending_n;
-
-static uint64_t	g_last_progress;
-static int	g_stalled;
-
-/* model defaults: DeepSeek-V2-Lite MLA (27 layers x 144KB) */
-static uint32_t	g_nslots = 0;            /* 0 = unspecified (SB/format default) */
-static uint32_t	g_recov_batch;
-static uint64_t	g_pool_capacity;       /* data pool capacity in slots */
-static uint32_t	g_seed = 1;
-static int	g_only_test = 0;
-static int	g_format = 0;
-static int	g_check_hugepage = 0;   /* -H: assert hugepage-backed shm */
-
 enum role { ROLE_WORKER = 0, ROLE_LOOKUP = 1 };
-static int	g_role = ROLE_WORKER;
 
 /* ---------------- shared-memory segment ---------------- */
 
@@ -676,7 +643,7 @@ shm_open_segment(int create, int adopt_capacity)
 			     (size_t)hash_size * sizeof(struct hash_entry) +
 			     (size_t)g_nslots * (sizeof(uint32_t) +
 						 sizeof(uint64_t) +
-						 sizeof(uint16_t));
+						 sizeof(uint16_t) + sizeof(uint8_t));
 		if (ftruncate(fd, (off_t)g_shm_size) != 0) {
 			close(fd);
 			return -ENOMEM;
@@ -720,7 +687,7 @@ shm_open_segment(int create, int adopt_capacity)
 		size_t expect = sizeof(struct shm_header) +
 				(size_t)hash_size_for(n) * sizeof(struct hash_entry) +
 				(size_t)n * (sizeof(uint32_t) + sizeof(uint64_t) +
-					     sizeof(uint16_t));
+					     sizeof(uint16_t) + sizeof(uint8_t));
 
 		if (g_shm->magic != SHM_MAGIC || g_shm->version != SHM_VERSION ||
 		    g_shm->hash_size != hash_size_for(n) ||
@@ -764,9 +731,12 @@ shm_register_worker(void)
 
 	shm_lock();
 	for (int i = 0; i < MAX_WORKERS; i++) {
-		if (g_shm->workers[i] == 0 || g_shm->workers[i] == pid) {
+		/* One slot per instance, not per PID: closing a second attachment
+		 * must not erase the first one's crash-detection registration. */
+		if (g_shm->workers[i] == 0) {
 			g_shm->workers[i] = pid;
 			g_registered_pid = pid;
+			ENGINE->worker_slot = i;
 			shm_unlock();
 			return 0;
 		}
@@ -782,14 +752,13 @@ shm_unregister_worker(void)
 		return;
 	}
 	shm_lock();
-	for (int i = 0; i < MAX_WORKERS; i++) {
-		if (g_shm->workers[i] == g_registered_pid) {
-			g_shm->workers[i] = 0;
-			break;
-		}
+	int i = ENGINE->worker_slot;
+	if (i >= 0 && g_shm->workers[i] == g_registered_pid) {
+		g_shm->workers[i] = 0;
 	}
 	shm_unlock();
 	g_registered_pid = 0;
+	ENGINE->worker_slot = -1;
 }
 
 static void
@@ -961,6 +930,83 @@ slot_bytes(void)
 
 /* ---------------- buffers ---------------- */
 
+/* Allocate DMA memory only during lifecycle setup, with all reactors paused.
+ * Tokens never own payloads. Direct-only engines allocate no bounce payloads. */
+static int
+store_io_pool_init(void)
+{
+	size_t bytes = shard_bytes();
+	uint64_t count = IO_POOL_BYTES / bytes;
+	const char *stage = "qpair";
+	int index = -1;
+	struct spdk_nvme_io_qpair_opts qopts;
+	uint32_t max_xfer = spdk_nvme_ns_get_max_io_xfer_size(g_ns);
+
+	if (!g_direct_only && count == 0) {
+		fprintf(stderr, "IO pool shard_bytes=%zu exceeds bounce budget=%ju; "
+			"configure direct-only mode before init\n", bytes, (uintmax_t)IO_POOL_BYTES);
+		return -E2BIG;
+	}
+	g_io_pool_count = IO_POOL_BUFS;
+	g_bounce_pool_count = g_direct_only ? 0 : (count > IO_POOL_BUFS ? IO_POOL_BUFS : count);
+	g_recov_batch = RECOV_BATCH_MAX;
+	if (max_xfer == 0) { return -EINVAL; }
+	uint64_t split = ((uint64_t)bytes + max_xfer - 1) / max_xfer;
+	uint64_t need = g_io_pool_count * split + NUM_IDX_BUFS + 16;
+	spdk_nvme_ctrlr_get_default_io_qpair_opts(g_ctrlr, &qopts, sizeof(qopts));
+	if (need > qopts.io_queue_size) {
+		qopts.io_queue_size = need > 1024 ? 1024 : (uint32_t)need;
+	}
+	if (qopts.io_queue_requests < 16384) { qopts.io_queue_requests = 16384; }
+	fprintf(stderr, "IO queue region=%s load_contexts=%u requested_depth=%u "
+		"requests=%u max_xfer=%u shard_splits=%ju\n", g_shm_name,
+		(unsigned)MAX_LOAD_CTX, qopts.io_queue_size, qopts.io_queue_requests,
+		max_xfer, (uintmax_t)split);
+	g_qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, &qopts, sizeof(qopts));
+	if (g_qpair == NULL) { goto fail; }
+	stage = "buffer-arrays";
+	if (g_bounce_pool_count) {
+		g_io_bufs = calloc(g_bounce_pool_count, sizeof(void *));
+	}
+	g_idx_bufs = calloc(NUM_IDX_BUFS, sizeof(void *));
+	if ((g_bounce_pool_count && g_io_bufs == NULL) || g_idx_bufs == NULL) { goto fail; }
+	for (uint32_t i = 0; i < g_io_pool_count; i++) {
+		g_io_free[g_io_free_top++] = i;
+	}
+	stage = "metadata-buffer";
+	g_meta_buf = spdk_zmalloc((size_t)g_recov_batch * g_sector_size, 4096, NULL,
+				 SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
+	if (g_meta_buf == NULL) { goto fail; }
+	stage = "shard-buffer";
+	for (uint32_t i = 0; i < g_bounce_pool_count; i++) {
+		index = (int)i;
+		g_io_bufs[i] = spdk_zmalloc(bytes, 4096, NULL,
+					 SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
+		if (g_io_bufs[i] == NULL) { goto fail; }
+		g_bounce_free[g_bounce_free_top++] = i;
+	}
+	stage = "index-buffer";
+	for (uint32_t i = 0; i < NUM_IDX_BUFS; i++) {
+		index = (int)i;
+		g_idx_bufs[i] = spdk_zmalloc(g_sector_size, 4096, NULL,
+					  SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
+		if (g_idx_bufs[i] == NULL) { goto fail; }
+		g_idx_free[g_idx_free_top++] = i;
+	}
+	fprintf(stderr, "IO pool pid=%ld region=%s offset_gib=%ju shard_bytes=%zu "
+		"tokens=%u bounce_count=%u bounce_bytes=%ju budget=%ju metadata_bytes=%zu direct_only=%d\n",
+		(long)getpid(), g_shm_name, (uintmax_t)g_offset_gib, bytes,
+		g_io_pool_count, g_bounce_pool_count, (uintmax_t)g_bounce_pool_count * bytes,
+		(uintmax_t)IO_POOL_BYTES, (size_t)g_recov_batch * g_sector_size, g_direct_only);
+	return 0;
+fail:
+	fprintf(stderr, "IO pool allocation failed pid=%ld region=%s offset_gib=%ju "
+		"shard_bytes=%zu tokens=%u bounce_count=%u stage=%s buffer_index=%d rc=%d\n",
+		(long)getpid(), g_shm_name, (uintmax_t)g_offset_gib, bytes,
+		g_io_pool_count, g_bounce_pool_count, stage, index, -ENOMEM);
+	return -ENOMEM;
+}
+
 static int
 io_buf_pop(void)
 {
@@ -977,6 +1023,18 @@ io_buf_push(uint32_t idx)
 }
 
 static int
+bounce_buf_pop(void)
+{
+	return g_bounce_free_top ? (int)g_bounce_free[--g_bounce_free_top] : -1;
+}
+
+static void
+bounce_buf_push(int idx)
+{
+	if (idx >= 0) { g_bounce_free[g_bounce_free_top++] = (uint32_t)idx; }
+}
+
+static int
 idx_buf_pop(void)
 {
 	if (g_idx_free_top == 0) {
@@ -989,6 +1047,36 @@ static void
 idx_buf_push(uint32_t idx)
 {
 	g_idx_free[g_idx_free_top++] = idx;
+}
+
+/* shm lock held. A retirement is published only after its invalidation is
+ * durable. Shared ownership lets the final pin holder reclaim it even after
+ * the invalidating reactor/process has exited. Clear before publishing the
+ * free slot, so no other attachment can reclaim it twice. */
+static void
+slot_reclaim_retired(uint32_t slot)
+{
+	if (g_retired[slot] &&
+	    __atomic_load_n(&g_pins[slot], __ATOMIC_RELAXED) == 0) {
+		g_retired[slot] = 0;
+		g_freelist[g_free_top++] = slot;
+	}
+}
+
+static void
+slot_unpin_locked(uint32_t slot)
+{
+	assert(__atomic_load_n(&g_pins[slot], __ATOMIC_RELAXED) > 0);
+	__atomic_fetch_sub(&g_pins[slot], 1, __ATOMIC_RELAXED);
+	slot_reclaim_retired(slot);
+}
+
+static void
+slot_unpin(uint32_t slot)
+{
+	shm_lock();
+	slot_unpin_locked(slot);
+	shm_unlock();
 }
 
 /* ---------------- record write path ---------------- */
@@ -1030,34 +1118,12 @@ rec_op_done(void *arg, const struct spdk_nvme_cpl *cpl)
 		op->active = 0;
 	} else if (op->free_on_done) {
 		shm_lock();
-		if (__atomic_load_n(&g_pins[op->slot], __ATOMIC_RELAXED) == 0) {
-			g_freelist[g_free_top++] = op->slot;
-			op->active = 0;
-		} else {
-			op->waiting_pin = 1;
-		}
+		g_retired[op->slot] = 1;
+		slot_reclaim_retired(op->slot);
 		shm_unlock();
+		op->active = 0;
 	} else {
 		op->active = 0;
-	}
-}
-
-static void
-advance_retired(void)
-{
-	for (int i = 0; i < NUM_REC_OPS; i++) {
-		struct rec_op *op = &g_rops[i];
-
-		if (!op->active || !op->waiting_pin) {
-			continue;
-		}
-		shm_lock();
-		if (__atomic_load_n(&g_pins[op->slot], __ATOMIC_RELAXED) == 0) {
-			g_freelist[g_free_top++] = op->slot;
-			op->waiting_pin = 0;
-			op->active = 0;
-		}
-		shm_unlock();
 	}
 }
 
@@ -1079,7 +1145,6 @@ submit_invalidation(const uint8_t id[16], uint32_t slot, uint64_t epoch)
 				return -1;
 			}
 			g_rops[i].active = 1;
-			g_rops[i].waiting_pin = 0;
 			g_rops[i].slot = slot;
 			g_rops[i].free_on_done = 1;
 			g_rops[i].buf = buf;
@@ -1131,6 +1196,7 @@ store_lookup(const uint8_t id[16])
 {
 	struct hash_entry *e;
 	int r;
+	if (g_shm == NULL || id == NULL) { return 0; }
 
 	shm_lock();
 	e = hash_find(id);
@@ -1149,6 +1215,7 @@ store_lookup_prefix(const uint8_t ids[][16], uint32_t n)
 {
 	uint32_t i;
 	uint64_t now = now_ms();
+	if (g_shm == NULL || ids == NULL) { return 0; }
 
 	shm_lock();
 	for (i = 0; i < n; i++) {
@@ -1265,7 +1332,7 @@ reactor_do_dump(struct store_op *op)
 		shm_lock();
 		g_freelist[g_free_top++] = slot;
 		if (old_slot != INVALID_SLOT) {
-			__atomic_fetch_sub(&g_pins[old_slot], 1, __ATOMIC_RELAXED);
+			slot_unpin_locked(old_slot);
 		}
 		shm_unlock();
 		dc->active = 0;
@@ -1294,7 +1361,7 @@ dump_finish(struct dump_ctx *dc, int status)
 		shm_unlock();
 	}
 	if (dc->old_pinned) {
-		__atomic_fetch_sub(&g_pins[dc->old_slot], 1, __ATOMIC_RELAXED);
+		slot_unpin(dc->old_slot);
 		dc->old_pinned = 0;
 	}
 	while (req != NULL) {
@@ -1374,6 +1441,7 @@ dump_shard_done(void *arg, const struct spdk_nvme_cpl *cpl)
 	struct dump_req *req = io->dr;
 
 	g_last_progress = spdk_get_ticks();
+	bounce_buf_push(io->bounce);
 	io_buf_push(io->buf);   /* release the concurrency token */
 	dc->outstanding--;
 	req->outstanding--;
@@ -1420,20 +1488,21 @@ load_shard_done(void *arg, const struct spdk_nvme_cpl *cpl)
 	struct load_ctx *lc = io->lc;
 
 	g_last_progress = spdk_get_ticks();
-	io_buf_push(io->buf);   /* release the concurrency token */
 	lc->acked++;
 	lc->outstanding--;
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		lc->failed = 1;
 		g_err_count++;
 		g_healthy = 0;
-	} else if (io->bounce) {
+	} else if (io->bounce >= 0) {
 		/* fallback path: copy from bounce buffer */
 		memcpy((uint8_t *)lc->dst +
 		       (size_t)io->offset * shard_bytes(),
-		       g_io_bufs[io->buf], shard_bytes());
+		       g_io_bufs[io->bounce], shard_bytes());
 	}
 	/* direct path: NVMe DMA already wrote into lc->dst */
+	bounce_buf_push(io->bounce);
+	io_buf_push(io->buf);
 }
 
 /* Reactor-side load handler: 0 = ctx registered, negative = rejected. */
@@ -1444,6 +1513,12 @@ reactor_do_load(struct store_op *op)
 	struct load_ctx *lc = NULL;
 	int rc = -ENOENT;
 
+	/* Contexts belong only to this reactor. Do not query shared state when
+	 * admission cannot succeed; completions must first release a context. */
+	for (int i = 0; i < MAX_LOAD_CTX; i++) {
+		if (!g_lctx[i].active) { lc = &g_lctx[i]; break; }
+	}
+	if (lc == NULL) { return -EBUSY; }
 	shm_lock();
 	e = hash_find(op->id);
 	if (e != NULL) {
@@ -1452,12 +1527,6 @@ reactor_do_load(struct store_op *op)
 		    op->count <= g_nshards - op->first &&
 		    op->len >= (uint64_t)op->count * shard_bytes()) {
 			rc = -EBUSY;
-			for (int i = 0; i < MAX_LOAD_CTX; i++) {
-				if (!g_lctx[i].active) {
-					lc = &g_lctx[i];
-					break;
-				}
-			}
 			if (lc != NULL) {
 				/* pin under the lock so GC cannot pick the
 				 * slot between find and pin */
@@ -1612,11 +1681,11 @@ advance_dumps(void)
 				g_sios[tok].buf = (uint32_t)tok;
 				g_sios[tok].shard = shard;
 				g_sios[tok].offset = req->cursor;
+				g_sios[tok].bounce = -1;
 
 				reg_rc = ensure_registered(src, shard_bytes());
 				if (reg_rc == 0) {
 					/* direct DMA to caller's buffer */
-					g_sios[tok].bounce = 0;
 					rc = spdk_nvme_ns_cmd_write(g_ns, g_qpair,
 								    src,
 								    shard_lba(dc->slot, shard),
@@ -1625,10 +1694,15 @@ advance_dumps(void)
 								    &g_sios[tok], 0);
 				} else if (reg_rc == 1) {
 					/* fallback: bounce via internal buffer */
-					g_sios[tok].bounce = 1;
-					memcpy(g_io_bufs[tok], src, shard_bytes());
+					int bounce = bounce_buf_pop();
+					if (bounce < 0) {
+						io_buf_push((uint32_t)tok);
+						break;
+					}
+					g_sios[tok].bounce = bounce;
+					memcpy(g_io_bufs[bounce], src, shard_bytes());
 					rc = spdk_nvme_ns_cmd_write(g_ns, g_qpair,
-								    g_io_bufs[tok],
+								    g_io_bufs[bounce],
 								    shard_lba(dc->slot, shard),
 								    g_shard_sectors,
 								    dump_shard_done,
@@ -1637,6 +1711,7 @@ advance_dumps(void)
 					rc = reg_rc;
 				}
 				if (rc < 0) {
+					bounce_buf_push(g_sios[tok].bounce);
 					io_buf_push((uint32_t)tok);
 					dc->failed = 1;
 					g_err_count++;
@@ -1727,11 +1802,11 @@ advance_loads(void)
 			g_sios[tok].buf = (uint32_t)tok;
 			g_sios[tok].shard = shard;
 			g_sios[tok].offset = offset;
+			g_sios[tok].bounce = -1;
 
 			reg_rc = ensure_registered(dst, shard_bytes());
 			if (reg_rc == 0) {
 				/* direct DMA into caller's buffer */
-				g_sios[tok].bounce = 0;
 				rc = spdk_nvme_ns_cmd_read(g_ns, g_qpair, dst,
 							    shard_lba(lc->slot, shard),
 							    g_shard_sectors,
@@ -1739,8 +1814,13 @@ advance_loads(void)
 							    &g_sios[tok], 0);
 			} else if (reg_rc == 1) {
 				/* fallback: bounce via internal buffer */
-				g_sios[tok].bounce = 1;
-				rc = spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_io_bufs[tok],
+				int bounce = bounce_buf_pop();
+				if (bounce < 0) {
+					io_buf_push((uint32_t)tok);
+					break;
+				}
+				g_sios[tok].bounce = bounce;
+				rc = spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_io_bufs[bounce],
 							    shard_lba(lc->slot, shard),
 							    g_shard_sectors,
 							    load_shard_done,
@@ -1749,6 +1829,7 @@ advance_loads(void)
 				rc = reg_rc;
 			}
 			if (rc < 0) {
+				bounce_buf_push(g_sios[tok].bounce);
 				io_buf_push((uint32_t)tok);
 				lc->failed = 1;
 				g_err_count++;
@@ -1762,7 +1843,7 @@ advance_loads(void)
 		     lc->submitted == lc->count) ||
 		    (lc->failed && lc->outstanding == 0)) {
 			lc->active = 0;
-			__atomic_fetch_sub(&g_pins[lc->slot], 1, __ATOMIC_RELAXED);
+			slot_unpin(lc->slot);
 			if (lc->cb != NULL) {
 				lc->cb(lc->cb_arg, lc->failed ? -EIO : 0);
 			}
@@ -1795,17 +1876,16 @@ abort_stalled_io(void)
 static void
 check_stall(void)
 {
-	static int had_inflight;
 	uint64_t now = spdk_get_ticks();
-	int inflight = g_io_free_top != IO_POOL_BUFS ||
+	int inflight = g_io_free_top != g_io_pool_count ||
 		       g_idx_free_top != NUM_IDX_BUFS;
 
 	if (!inflight) {
-		had_inflight = 0;
+		ENGINE->had_inflight = 0;
 		return;
 	}
-	if (!had_inflight) {
-		had_inflight = 1;
+	if (!ENGINE->had_inflight) {
+		ENGINE->had_inflight = 1;
 		g_last_progress = now;
 		return;
 	}
@@ -1832,19 +1912,19 @@ store_poll(void)
 	spdk_nvme_ctrlr_process_admin_completions(g_ctrlr);
 	advance_dumps();
 	advance_loads();
-	advance_retired();
 	if (!g_stalled) {
 		advance_invs();
 		check_stall();
 	}
 }
 
-/* True when every in-flight IO, record op and queued invalidation has
- * drained (partial dumps that have not committed hold no buffers). */
+/* Fences local DMA and durable callbacks. Retired pinned slots are owned by
+ * shared state, not local work: a barrier/stop must not await remote pins. */
 static int
 store_io_drained(void)
 {
-	return g_io_free_top == IO_POOL_BUFS &&
+	return g_io_free_top == g_io_pool_count &&
+	       g_bounce_free_top == g_bounce_pool_count &&
 	       g_idx_free_top == NUM_IDX_BUFS &&
 	       g_pinv_n == 0;
 }
@@ -1870,20 +1950,6 @@ void store_gc_stop(void);
  * 4KB backing remains functionally valid, only more expensive.
  */
 
-#define REG_PAGE_SIZE   4096ULL
-#define REG_CACHE_MAX   16                          /* SHM pools per process */
-
-struct reg_range {
-	uint64_t start;                                 /* 4KB-aligned */
-	uint64_t end;
-	uint32_t refs;
-	uint8_t owned;                                  /* unregister on fini */
-};
-
-static struct reg_range g_reg_cache[REG_CACHE_MAX];
-static uint32_t g_reg_count;
-static uint64_t g_reg_total_bytes;
-static int g_direct_dma;   /* .so sets to 1 when buffers are SHM/hugepage */
 
 /* Check if [addr, addr+len) is fully within a registered range. */
 static int
@@ -1915,13 +1981,86 @@ range_vtophys_valid(uint64_t addr, uint64_t len)
 	return 1;
 }
 
+/* process_mu held. Registration notifications mutate every controller's
+ * translation maps, so park ALL engine reactors, not just this instance. */
+static void
+process_reactors_pause(int pause)
+{
+	struct spdk_store_engine *saved = current_engine;
+
+	for (struct spdk_store_engine *e = process_engines; e != NULL; e = e->next) {
+		current_engine = e;
+		if (pause) { reactor_pause(); } else { reactor_resume(); }
+	}
+	current_engine = saved;
+}
+
+/* Exact and contained registrations share the owning process range. Partial
+ * overlaps are rejected: SPDK cannot unregister part of a registered region. */
+static int
+process_memory_get(uint64_t start, uint64_t end)
+{
+	int rc;
+	for (size_t i = 0; i < process_reg_count; i++) {
+		struct reg_range *r = &process_regs[i];
+		if (start >= r->start && end <= r->end) {
+			if (g_trid.trtype == SPDK_NVME_TRANSPORT_PCIE &&
+			    !range_vtophys_valid(start, end - start)) { return -ENOTSUP; }
+			r->refs++;
+			return 0;
+		}
+		if (start < r->end && end > r->start) { return -EINVAL; }
+	}
+	struct reg_range *regs = realloc(process_regs,
+					(process_reg_count + 1) * sizeof(*regs));
+	if (regs == NULL) { return -ENOMEM; }
+	process_regs = regs;
+	struct reg_range r = {.start = start, .end = end, .refs = 1};
+	rc = spdk_mem_reserve((void *)(uintptr_t)start, end - start);
+	if (rc == 0 || rc == -EBUSY) {
+		rc = spdk_mem_register((void *)(uintptr_t)start, end - start);
+		if (rc == 0) {
+			r.owned = 1;
+		} else if (rc == -EBUSY && range_vtophys_valid(start, end - start)) {
+			/* External owner must retain its registration for our lifetime. */
+			rc = 0;
+		}
+	}
+	if (rc == 0 && g_trid.trtype == SPDK_NVME_TRANSPORT_PCIE &&
+	    !range_vtophys_valid(start, end - start)) {
+		if (r.owned) { spdk_mem_unregister((void *)(uintptr_t)start, end - start); }
+		rc = -ENOTSUP;
+	}
+	if (rc == 0) { process_regs[process_reg_count++] = r; }
+	return rc;
+}
+
+static int
+process_memory_put(uint64_t start, uint64_t end)
+{
+	for (size_t i = 0; i < process_reg_count; i++) {
+		struct reg_range *r = &process_regs[i];
+		if (start < r->start || end > r->end) { continue; }
+		if (r->refs > 1) { r->refs--; return 0; }
+		int rc = 0;
+		if (r->owned) {
+			rc = spdk_mem_unregister((void *)(uintptr_t)r->start, r->end - r->start);
+		}
+		if (rc == 0) { *r = process_regs[--process_reg_count]; }
+		return rc;
+	}
+	return -ENOENT;
+}
+
 int
 store_register_memory(void *addr, uint64_t size)
 {
 	uint64_t start, end;
 	int rc;
+	if (g_ctrlr == NULL) { return -ENODEV; }
 
-	if (addr == NULL || size == 0) {
+	if (addr == NULL || size == 0 ||
+	    size > UINT64_MAX - (uintptr_t)addr - (REG_PAGE_SIZE - 1)) {
 		return -EINVAL;
 	}
 	start = (uint64_t)(uintptr_t)addr & ~(REG_PAGE_SIZE - 1);
@@ -1939,41 +2078,20 @@ store_register_memory(void *addr, uint64_t size)
 		return -ENOSPC;
 	}
 
-	/* Reserve avoids allocation in map notification callbacks.  Park the
-	 * reactor while translation maps change. */
-	reactor_pause();
-	rc = spdk_mem_reserve((void *)start, end - start);
-	if (rc != 0 && rc != -EBUSY) {
-		reactor_resume();
-		return rc;
+	pthread_mutex_lock(&process_mu);
+	process_reactors_pause(1);
+	rc = process_memory_get(start, end);
+	if (rc == 0) {
+		g_reg_cache[g_reg_count].start = start;
+		g_reg_cache[g_reg_count].end = end;
+		g_reg_cache[g_reg_count].refs = 1;
+		g_reg_count++;
+		g_reg_total_bytes += end - start;
+		g_direct_dma = 1;
 	}
-	rc = spdk_mem_register((void *)start, end - start);
-	if (rc == -EBUSY && range_vtophys_valid(start, end - start)) {
-		/* Another subsystem already registered the full range; cache it
-		 * as borrowed and never unregister it from here. */
-		g_reg_cache[g_reg_count].owned = 0;
-	} else if (rc != 0) {
-		reactor_resume();
-		return rc;
-	} else {
-		g_reg_cache[g_reg_count].owned = 1;
-	}
-	if (g_trid.trtype == SPDK_NVME_TRANSPORT_PCIE &&
-	    !range_vtophys_valid(start, end - start)) {
-		if (g_reg_cache[g_reg_count].owned) {
-			spdk_mem_unregister((void *)start, end - start);
-		}
-		reactor_resume();
-		return -ENOTSUP;
-	}
-	reactor_resume();
-	g_reg_cache[g_reg_count].start = start;
-	g_reg_cache[g_reg_count].end = end;
-	g_reg_cache[g_reg_count].refs = 1;
-	g_reg_count++;
-	g_reg_total_bytes += end - start;
-	g_direct_dma = 1;
-	return 0;
+	process_reactors_pause(0);
+	pthread_mutex_unlock(&process_mu);
+	return rc;
 }
 
 int
@@ -1981,7 +2099,8 @@ store_unregister_memory(void *addr, uint64_t size)
 {
 	uint64_t start, end;
 
-	if (addr == NULL || size == 0) {
+	if (addr == NULL || size == 0 ||
+	    size > UINT64_MAX - (uintptr_t)addr - (REG_PAGE_SIZE - 1)) {
 		return -EINVAL;
 	}
 	start = (uint64_t)(uintptr_t)addr & ~(REG_PAGE_SIZE - 1);
@@ -2006,20 +2125,19 @@ store_unregister_memory(void *addr, uint64_t size)
 		if (--g_reg_cache[i].refs > 0) {
 			return 0;
 		}
-		if (g_reg_cache[i].owned) {
-			reactor_pause();
-			int rc = spdk_mem_unregister((void *)start, end - start);
-			reactor_resume();
-
-			if (rc != 0) {
-				g_reg_cache[i].refs = 1;
-				return rc;
-			}
+		pthread_mutex_lock(&process_mu);
+		process_reactors_pause(1);
+		int rc = process_memory_put(start, end);
+		if (rc != 0) {
+			g_reg_cache[i].refs = 1;
+		} else {
+			g_reg_total_bytes -= end - start;
+			g_reg_cache[i] = g_reg_cache[--g_reg_count];
+			g_direct_dma = g_reg_count > 0;
 		}
-		g_reg_total_bytes -= end - start;
-		g_reg_cache[i] = g_reg_cache[--g_reg_count];
-		g_direct_dma = g_reg_count > 0;
-		return 0;
+		process_reactors_pause(0);
+		pthread_mutex_unlock(&process_mu);
+		return rc;
 	}
 	return -ENOENT;
 }
@@ -2028,7 +2146,7 @@ static int
 ensure_registered(const void *addr, size_t len)
 {
 	if (!g_direct_dma) {
-		return 1;            /* standalone tests use bounce buffers */
+		return g_direct_only ? -EFAULT : 1;
 	}
 	return is_registered((uint64_t)(uintptr_t)addr, len) ? 0 : -EFAULT;
 }
@@ -2038,36 +2156,6 @@ ensure_registered(const void *addr, size_t len)
 
 
 
-#define OP_RING_SIZE    4096    /* power of 2 for spdk_ring */
-#define MAX_PENDING     OP_RING_SIZE /* reactor-side backpressure */
-
-static struct spdk_ring	*g_op_ring;
-static pthread_t	g_reactor_tid;
-static volatile int	g_reactor_stop;
-static volatile int	g_reactor_pause_req;
-static volatile int	g_reactor_paused;       /* set by reactor when parked */
-static int		g_reactor_started;
-static pthread_mutex_t	g_reactor_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t	g_reactor_paused_cv = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t	g_reactor_resume_cv = PTHREAD_COND_INITIALIZER;
-static uint32_t		g_barriers_n;
-
-static pthread_t	g_gc_tid;
-static pthread_mutex_t	g_gc_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t	g_gc_cv = PTHREAD_COND_INITIALIZER;
-static int		g_gc_started;
-static int		g_gc_stop_req; /* timer mutex */
-static int		g_gc_enabled;  /* atomic: timer/lifecycle -> reactor */
-static int		g_gc_requested; /* atomic: timer -> reactor */
-static double		g_gc_threshold;
-static double		g_gc_recycle;
-static uint32_t		g_gc_interval;
-static int		g_gc_fd = -1;
-/* The following cycle state belongs exclusively to the reactor. */
-static int		g_gc_owner;
-static uint32_t		g_gc_remaining;
-static uint64_t		g_gc_cycle_selected;
-static uint64_t		g_gc_cycle_errors;
 
 static int
 gc_invalidations_drained(void)
@@ -2107,8 +2195,8 @@ advance_periodic_gc(void)
 		g_gc_cycle_selected = 0;
 		g_gc_cycle_errors = g_err_count;
 	}
-	/* One batch at a time, including durable callbacks and pin retirement.
-	 * This bounds queue pressure and holds the gate through actual frees. */
+	/* One batch at a time through durable callbacks. Any pinned retirement
+	 * is shared-owned; it must not hold this gate or GC_STOP hostage. */
 	if (!gc_invalidations_drained()) {
 		return;
 	}
@@ -2163,9 +2251,6 @@ done:
 	flock(g_gc_fd, LOCK_UN);
 }
 
-/* parked ops owned by the reactor */
-static struct store_op *g_pending[MAX_PENDING];
-static struct store_op *g_barriers[MAX_PENDING];
 
 static void
 op_complete(struct store_op *op, int rc)
@@ -2237,6 +2322,15 @@ process_op(struct store_op *op)
 	case OP_CANCEL_PARTIAL:
 	case OP_GC_STOP:
 		if (op->type == OP_CANCEL_PARTIAL) {
+			/* Parked partial dumps cannot be allowed to allocate a fresh
+			 * context after the cancellation scan during shutdown. */
+			for (uint32_t i = 0; i < g_pending_n; ) {
+				struct store_op *pending = g_pending[i];
+				if (pending->type != OP_DUMP) { i++; continue; }
+				g_pending[i] = g_pending[--g_pending_n];
+				op_complete(pending, -ECANCELED);
+				free(pending);
+			}
 			for (int i = 0; i < MAX_DUMP_CTX; i++) {
 				if (g_dctx[i].active && g_dctx[i].commit_phase == 0) {
 					g_dctx[i].failed = 1;
@@ -2374,6 +2468,7 @@ advance_barriers(void)
 static void *
 reactor_main(void *arg)
 {
+	current_engine = arg;
 	pthread_setname_np(pthread_self(), "ucm_spdk_reactor");
 
 	while (!g_reactor_stop) {
@@ -2432,6 +2527,7 @@ op_new(int type, const uint8_t id[16], store_cb cb, void *arg,
 static int
 op_submit(struct store_op *op)
 {
+	if (g_op_ring == NULL) { free(op); return -ENODEV; }
 	size_t n = spdk_ring_enqueue(g_op_ring, (void **)&op, 1, NULL);
 
 	if (n != 1) {
@@ -2502,6 +2598,7 @@ store_sync_op(int type)
 	struct syncw w;
 	struct store_op *op;
 	int rc;
+	if (!g_reactor_started) { return -ENODEV; }
 
 	syncw_init(&w);
 	for (;;) {
@@ -2535,7 +2632,7 @@ store_quiesce(void)
 static void *
 gc_timer_main(void *arg)
 {
-	(void)arg;
+	current_engine = arg;
 	pthread_setname_np(pthread_self(), "ucm_spdk_gc");
 	pthread_mutex_lock(&g_gc_mu);
 	while (!g_gc_stop_req) {
@@ -2581,7 +2678,7 @@ store_gc_start(double threshold, double recycle, uint32_t interval)
 	g_gc_interval = interval;
 	g_gc_stop_req = 0;
 	__atomic_store_n(&g_gc_enabled, 1, __ATOMIC_RELEASE);
-	rc = pthread_create(&g_gc_tid, NULL, gc_timer_main, NULL);
+	rc = pthread_create(&g_gc_tid, NULL, gc_timer_main, ENGINE);
 	if (rc != 0) {
 		__atomic_store_n(&g_gc_enabled, 0, __ATOMIC_RELEASE);
 		close(g_gc_fd);
@@ -2608,7 +2705,7 @@ store_gc_stop(void)
 	pthread_cond_signal(&g_gc_cv);
 	pthread_mutex_unlock(&g_gc_mu);
 	pthread_join(g_gc_tid, NULL);
-	/* Reactor retires the current batch and releases its gate before close.
+	/* Reactor makes the current batch durable and releases its gate before close.
 	 * Unlike a store barrier this does not wait for partial Cache dumps. */
 	while (store_sync_op(OP_GC_STOP) == -EBUSY) {
 		sched_yield();
@@ -2658,6 +2755,7 @@ reactor_start(void)
 	if (g_reactor_started) {
 		return 0;
 	}
+	if (g_ctrlr == NULL || g_qpair == NULL) { return -ENODEV; }
 	g_op_ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, OP_RING_SIZE,
 				     SPDK_ENV_NUMA_ID_ANY);
 	if (g_op_ring == NULL) {
@@ -2665,12 +2763,30 @@ reactor_start(void)
 	}
 	g_reactor_stop = 0;
 	g_reactor_pause_req = 0;
-	if (pthread_create(&g_reactor_tid, NULL, reactor_main, NULL) != 0) {
+	pthread_attr_t attr;
+	int rc = pthread_attr_init(&attr);
+	if (rc == 0) {
+		if (ENGINE->reactor_affinity_set) {
+			rc = pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &ENGINE->reactor_affinity);
+		}
+		if (rc == 0) { rc = pthread_create(&g_reactor_tid, &attr, reactor_main, ENGINE); }
+		pthread_attr_destroy(&attr);
+	}
+	if (rc != 0) {
+		fprintf(stderr, "reactor start/affinity failed region=%s rc=%d (%s)\n",
+			g_shm_name, rc, strerror(rc));
 		spdk_ring_free(g_op_ring);
 		g_op_ring = NULL;
-		return -errno;
+		return -rc;
 	}
 	g_reactor_started = 1;
+	if (ENGINE->reactor_affinity_set) {
+		fprintf(stderr, "reactor affinity region=%s cpus=", g_shm_name);
+		for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+			if (CPU_ISSET(cpu, &ENGINE->reactor_affinity)) { fprintf(stderr, "%d,", cpu); }
+		}
+		fprintf(stderr, "\n");
+	}
 	return 0;
 }
 
@@ -2681,6 +2797,7 @@ reactor_stop(void)
 	if (!g_reactor_started) {
 		return;
 	}
+	store_sync_op(OP_CANCEL_PARTIAL);
 	pthread_mutex_lock(&g_reactor_mu);
 	g_reactor_stop = 1;
 	g_reactor_pause_req = 0;
@@ -2731,32 +2848,53 @@ sector_batch(uint64_t lba, uint32_t nlbas, void *buf, int is_write)
 	return b.status;
 }
 
-/* Zero index records [from, to) in batches. */
+/* Metadata scratch is exclusive to serialized initialization or quiesced
+ * maintenance. sector_batch completes before the next scratch user runs;
+ * the reactor data/record paths never use this buffer. */
 static int store_sb_write(void);
+
+/* process_mu protects the live instance list in library initialization.
+ * Validate before any formatting writes, including metadata overlap. The
+ * on-disk layout has no partition table, so cross-process bounds remain the
+ * deployer's responsibility. Multiple attachments of the same region are OK. */
+static int
+store_region_available(uint32_t nslots)
+{
+	uint64_t end = g_pool_base + (uint64_t)nslots * g_slot_sectors;
+	if (nslots == 0 || nslots > g_index_slots || end > g_num_sectors) {
+		return -EINVAL;
+	}
+	for (struct spdk_store_engine *e = process_engines; e != NULL; e = e->next) {
+		if (e == ENGINE || !e->initialized || e->ctrlr != g_ctrlr || e->ns != g_ns) {
+			continue;
+		}
+		uint64_t other_end = e->pool_base + (uint64_t)e->nslots * e->slot_sectors;
+		if (g_data_base == e->data_base && nslots == e->nslots &&
+		    g_slot_sectors == e->slot_sectors && g_shard_sectors == e->shard_sectors &&
+		    !g_format) { continue; }
+		if (g_data_base < other_end && end > e->data_base) { return -EBUSY; }
+	}
+	return 0;
+}
 
 static int
 zero_records(uint32_t from, uint32_t to)
 {
-	int rbuf = io_buf_pop();
 	uint64_t left = to - from;
 	uint64_t lba = g_index_base + from;
 	int rc = 0;
 
-	if (rbuf < 0) {
-		return -EBUSY;
-	}
-	memset(g_io_bufs[rbuf], 0, (size_t)g_recov_batch * g_sector_size);
+	memset(g_meta_buf, 0, (size_t)g_recov_batch * g_sector_size);
 	while (left > 0) {
 		uint32_t n = (left < g_recov_batch) ? (uint32_t)left : g_recov_batch;
 
-		rc = sector_batch(lba, n, g_io_bufs[rbuf], 1);
+		rc = sector_batch(lba, n, g_meta_buf, 1);
 		if (rc != 0) {
 			break;
 		}
 		lba += n;
 		left -= n;
 	}
-	io_buf_push((uint32_t)rbuf);
 	return rc;
 }
 
@@ -2767,20 +2905,15 @@ zero_records(uint32_t from, uint32_t to)
 static int
 store_sb_begin(void)
 {
-	int rbuf = io_buf_pop();
 	struct superblock *sb;
 	int rc;
 
-	if (rbuf < 0) {
-		return -EBUSY;
-	}
-	sb = g_io_bufs[rbuf];
+	sb = g_meta_buf;
 	build_superblock(sb);
 	sb->nslots = 0;          /* publication in progress */
 	sb->reserved = g_nslots; /* intended capacity */
 	sb->checksum = (uint64_t)hash_fn_n(sb, SB_COVER);
 	rc = sector_batch(sb_lba(), 1, sb, 1);
-	io_buf_push((uint32_t)rbuf);
 	return rc;
 }
 
@@ -2789,6 +2922,8 @@ store_format(void)
 {
 	int rc;
 
+	rc = store_region_available(g_nslots);
+	if (rc != 0) { return rc; }
 	rc = store_sb_begin();
 	if (rc != 0) {
 		return rc;
@@ -2805,26 +2940,19 @@ store_format(void)
 static int
 store_sb_read(struct superblock *out)
 {
-	int rbuf = io_buf_pop();
 	struct superblock *sb;
 	int rc;
 
-	if (rbuf < 0) {
-		return -EBUSY;
-	}
-	rc = sector_batch(sb_lba(), 1, g_io_bufs[rbuf], 0);
+	rc = sector_batch(sb_lba(), 1, g_meta_buf, 0);
 	if (rc != 0) {
-		io_buf_push((uint32_t)rbuf);
 		return rc;
 	}
-	sb = g_io_bufs[rbuf];
+	sb = g_meta_buf;
 	if (sb->magic != SB_MAGIC ||
 	    sb->checksum != (uint64_t)hash_fn_n(sb, SB_COVER)) {
-		io_buf_push((uint32_t)rbuf);
 		return -ENOENT;
 	}
 	*out = *sb;
-	io_buf_push((uint32_t)rbuf);
 	return 0;
 }
 
@@ -2850,26 +2978,21 @@ store_sb_geometry_ok(const struct superblock *sb)
 static int
 sb_range_has_live(uint32_t from, uint32_t to)
 {
-	int rbuf = io_buf_pop();
 	uint32_t scanned = from;
 	int found = 0;
 
-	if (rbuf < 0) {
-		return -1;
-	}
 	while (scanned < to && !found) {
 		uint32_t n = (to - scanned < g_recov_batch)
 			     ? (to - scanned) : g_recov_batch;
 		int rc = sector_batch(g_index_base + scanned, n,
-				      g_io_bufs[rbuf], 0);
+				      g_meta_buf, 0);
 
 		if (rc != 0) {
-			io_buf_push((uint32_t)rbuf);
 			return -1;
 		}
 		for (uint32_t i = 0; i < n; i++) {
 			const struct index_record *rec =
-				(const void *)((uint8_t *)g_io_bufs[rbuf] +
+				(const void *)((uint8_t *)g_meta_buf +
 					       (size_t)i * g_sector_size);
 			uint32_t slot = scanned + i;
 
@@ -2884,31 +3007,24 @@ sb_range_has_live(uint32_t from, uint32_t to)
 		}
 		scanned += n;
 	}
-	io_buf_push((uint32_t)rbuf);
 	return found;
 }
 
 static int
 store_sb_write(void)
 {
-	int rbuf = io_buf_pop();
 	int rc;
 
-	if (rbuf < 0) {
-		return -EBUSY;
-	}
-	build_superblock(g_io_bufs[rbuf]);
-	rc = sector_batch(sb_lba(), 1, g_io_bufs[rbuf], 1);
-	io_buf_push((uint32_t)rbuf);
+	build_superblock(g_meta_buf);
+	rc = sector_batch(sb_lba(), 1, g_meta_buf, 1);
 	return rc;
 }
 
 /*
  * Invalidate every block and re-publish the region with the runtime
  * geometry (a model switch). The byte capacity is preserved. Called
- * with the global maintenance lease held exclusively: no other SPDK
- * store process is alive, because a model switch is a rolling restart
- * by definition.
+ * with this region's maintenance lease held exclusively: no other attachment
+ * of this region is alive. Other regions may continue serving requests.
  */
 static int
 store_switch_region(const struct superblock *old)
@@ -3004,6 +3120,10 @@ store_resolve_region(void)
 			return rc;
 		}
 
+		rc = store_region_available(g_nslots ? g_nslots :
+					(sb.nslots ? sb.nslots : sb.reserved));
+		if (rc != 0) { return rc; }
+
 		if (sb.nslots == 0) {
 			/* interrupted format or model switch: finish it */
 			if (store_maintenance_upgrade() != 0) {
@@ -3060,7 +3180,7 @@ store_resolve_region(void)
 					continue;
 				}
 				fprintf(stderr, "model change requires all "
-					"SPDK store processes to exit; "
+					"attachments of this region to exit; "
 					"retry\n");
 				return -EBUSY;
 			}
@@ -3084,8 +3204,7 @@ store_resolve_region(void)
 			return 0;
 		}
 		if (store_maintenance_upgrade() != 0) {
-			fprintf(stderr, "resize requires all SPDK store "
-				"processes to stop\n");
+			fprintf(stderr, "resize requires all other attachments of this region to stop\n");
 			return -EBUSY;
 		}
 		if (!g_shm_recovery_owner) {
@@ -3135,24 +3254,21 @@ store_resolve_region(void)
 static int
 store_recover(void)
 {
-	int rbuf = io_buf_pop();
 	uint64_t scanned = 0;
 	uint64_t max_epoch_seen = 0;
 	uint8_t *used;
 	int rc = 0;
 
-	if (rbuf < 0) {
-		return -EBUSY;
-	}
 	used = calloc(g_nslots, 1);
 	if (used == NULL) {
-		io_buf_push((uint32_t)rbuf);
 		return -ENOMEM;
 	}
 
 	shm_lock();
 	memset(g_hash, 0, (size_t)(g_hash_mask + 1) * sizeof(*g_hash));
 	memset(g_shm->workers, 0, sizeof(g_shm->workers));
+	memset(g_pins, 0, g_nslots * sizeof(*g_pins));
+	memset(g_retired, 0, g_nslots * sizeof(*g_retired));
 	g_hash_count = 0;
 	g_live_count = 0;
 	g_epoch = 0;
@@ -3161,13 +3277,13 @@ store_recover(void)
 		uint32_t n = (g_nslots - scanned < g_recov_batch)
 			     ? (uint32_t)(g_nslots - scanned) : g_recov_batch;
 
-		rc = sector_batch(g_index_base + scanned, n, g_io_bufs[rbuf], 0);
+		rc = sector_batch(g_index_base + scanned, n, g_meta_buf, 0);
 		if (rc != 0) {
 			break;
 		}
 		for (uint32_t i = 0; i < n; i++) {
 			const struct index_record *rec =
-				(const void *)((uint8_t *)g_io_bufs[rbuf] +
+				(const void *)((uint8_t *)g_meta_buf +
 					       (size_t)i * g_sector_size);
 			uint32_t slot = (uint32_t)scanned + i;
 			struct hash_entry *e = NULL;
@@ -3219,7 +3335,6 @@ store_recover(void)
 		}
 		scanned += n;
 	}
-	io_buf_push((uint32_t)rbuf);
 	if (rc != 0) {
 		shm_unlock();
 		free(used);
@@ -3594,12 +3709,12 @@ t6_overwrite(void)
 	store_quiesce();
 	if (g_free_top != free_before - 2) {
 		printf("    pinned old slot was reused early\n");
-		__atomic_fetch_sub(&g_pins[old_slot], 1, __ATOMIC_RELAXED);
+		slot_unpin(old_slot);
 		test_pin = 0;
 		rc = -1;
 		goto out;
 	}
-	__atomic_fetch_sub(&g_pins[old_slot], 1, __ATOMIC_RELAXED);
+	slot_unpin(old_slot);
 	test_pin = 0;
 	store_quiesce();
 	/* one live block remains: net free must drop by exactly one */
@@ -3630,7 +3745,7 @@ t6_overwrite(void)
 	}
 out:
 	if (test_pin) {
-		__atomic_fetch_sub(&g_pins[old_slot], 1, __ATOMIC_RELAXED);
+		slot_unpin(old_slot);
 	}
 	free(data);
 	return rc;
@@ -3738,7 +3853,6 @@ t9_corrupt_record(void)
 	{
 		uint8_t *data = malloc(slot_bytes());
 		struct hash_entry *e;
-		int jbuf;
 
 		if (data == NULL) {
 			return -1;
@@ -3755,15 +3869,10 @@ t9_corrupt_record(void)
 		if (e == NULL) {
 			return -1;
 		}
-		jbuf = io_buf_pop();
-		if (jbuf < 0) {
-			return -1;
-		}
-		memset(g_io_bufs[jbuf], 0xA5, g_sector_size);
 		reactor_pause();
-		rc = sector_batch(record_lba(e->slot), 1, g_io_bufs[jbuf], 1);
+		memset(g_meta_buf, 0xA5, g_sector_size);
+		rc = sector_batch(record_lba(e->slot), 1, g_meta_buf, 1);
 		reactor_resume();
-		io_buf_push((uint32_t)jbuf);
 		if (rc != 0) {
 			return -1;
 		}
@@ -3813,8 +3922,12 @@ pin_all_live(int delta)
 	shm_lock();
 	for (uint32_t h = 0; h <= g_hash_mask; h++) {
 		if (g_hash[h].used == 1) {
-			__atomic_fetch_add(&g_pins[g_hash[h].slot], (uint16_t)delta,
-					   __ATOMIC_RELAXED);
+			if (delta < 0) {
+				slot_unpin_locked(g_hash[h].slot);
+			} else {
+				__atomic_fetch_add(&g_pins[g_hash[h].slot], (uint16_t)delta,
+						   __ATOMIC_RELAXED);
+			}
 		}
 	}
 	shm_unlock();
@@ -4313,7 +4426,7 @@ t14_model_switch(void)
 	uint8_t *data = malloc(slot_bytes());
 	struct superblock disk;
 	uint8_t id[16];
-	int rbuf, rc;
+	int rc;
 
 	if (data == NULL) {
 		return -1;
@@ -4333,13 +4446,8 @@ t14_model_switch(void)
 	}
 
 	/* 2. garbage reads as "not formatted" */
-	rbuf = io_buf_pop();
-	if (rbuf < 0) {
-		goto fail_paused;
-	}
-	memset(g_io_bufs[rbuf], 0, g_sector_size);
-	rc = sector_batch(sb_lba(), 1, g_io_bufs[rbuf], 1);
-	io_buf_push((uint32_t)rbuf);
+	memset(g_meta_buf, 0, g_sector_size);
+	rc = sector_batch(sb_lba(), 1, g_meta_buf, 1);
 	if (rc != 0) {
 		goto fail_paused;
 	}
@@ -4357,12 +4465,8 @@ t14_model_switch(void)
 	}
 
 	/* 4. forge a leftover superblock from a different model */
-	rbuf = io_buf_pop();
-	if (rbuf < 0) {
-		goto fail_paused;
-	}
 	{
-		struct superblock *sb = g_io_bufs[rbuf];
+		struct superblock *sb = g_meta_buf;
 
 		build_superblock(sb);
 		sb->shard_sectors = g_shard_sectors * 2;
@@ -4371,7 +4475,6 @@ t14_model_switch(void)
 		sb->checksum = (uint64_t)hash_fn_n(sb, SB_COVER);
 		rc = sector_batch(sb_lba(), 1, sb, 1);
 	}
-	io_buf_push((uint32_t)rbuf);
 	if (rc != 0) {
 		goto fail_paused;
 	}
@@ -4576,11 +4679,19 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 static void
 store_device_cleanup(void)
 {
+	/* Stop fences callbacks/DMA before registration or buffer release. */
 	reactor_stop();
+	if (g_qpair != NULL) {
+		spdk_nvme_ctrlr_free_io_qpair(g_qpair);
+		g_qpair = NULL;
+	}
 	while (g_reg_count > 0) {
 		struct reg_range r = g_reg_cache[g_reg_count - 1];
 
-		if (r.owned && spdk_mem_unregister((void *)r.start, r.end - r.start) != 0) {
+		process_reactors_pause(1);
+		int rc = process_memory_put(r.start, r.end);
+		process_reactors_pause(0);
+		if (rc != 0) {
 			break;
 		}
 		g_reg_total_bytes -= r.end - r.start;
@@ -4590,7 +4701,8 @@ store_device_cleanup(void)
 	shm_close_segment();
 	store_lease_close();
 	store_maintenance_close();
-	for (int i = 0; i < IO_POOL_BUFS; i++) {
+	process_reactors_pause(1);
+	for (uint32_t i = 0; i < g_bounce_pool_count; i++) {
 		if (g_io_bufs != NULL && g_io_bufs[i] != NULL) {
 			spdk_free(g_io_bufs[i]);
 		}
@@ -4602,24 +4714,140 @@ store_device_cleanup(void)
 	}
 	free(g_io_bufs);
 	free(g_idx_bufs);
+	if (g_meta_buf != NULL) { spdk_free(g_meta_buf); }
+	g_meta_buf = NULL;
 	g_io_bufs = NULL;
 	g_idx_bufs = NULL;
 	g_io_free_top = 0;
+	g_io_pool_count = 0;
+	g_bounce_free_top = g_bounce_pool_count = 0;
+	g_recov_batch = 0;
+	memset(g_io_free, 0, sizeof(g_io_free));
+	memset(g_bounce_free, 0, sizeof(g_bounce_free));
+	memset(g_sios, 0, sizeof(g_sios));
 	g_idx_free_top = 0;
-	if (g_qpair != NULL) {
-		spdk_nvme_ctrlr_free_io_qpair(g_qpair);
-		g_qpair = NULL;
-	}
+	process_reactors_pause(0);
 	if (g_ctrlr != NULL) {
-		struct spdk_nvme_detach_ctx *detach_ctx = NULL;
-
-		spdk_nvme_detach_async(g_ctrlr, &detach_ctx);
-		if (detach_ctx) {
-			spdk_nvme_detach_poll(detach_ctx);
+		struct engine_controller *c = ENGINE->controller;
+		if (c == NULL || --c->refs == 0) {
+			struct spdk_nvme_detach_ctx *detach_ctx = NULL;
+			spdk_nvme_detach_async(g_ctrlr, &detach_ctx);
+			if (detach_ctx) { spdk_nvme_detach_poll(detach_ctx); }
+			if (c != NULL) {
+				struct engine_controller **p = &process_controllers;
+				while (*p != c) { p = &(*p)->next; }
+				*p = c->next;
+				free(c);
+			}
 		}
+		ENGINE->controller = NULL;
 		g_ctrlr = NULL;
 		g_ns = NULL;
 	}
+	ENGINE->initialized = 0;
+	g_healthy = 1;
+	g_stalled = 0;
+	ENGINE->had_inflight = 0;
+	g_err_count = 0;
+	g_pinv_n = g_pending_n = g_barriers_n = 0;
+	g_region_reset = 0;
+	memset(g_dctx, 0, sizeof(g_dctx));
+	memset(g_lctx, 0, sizeof(g_lctx));
+	memset(g_rops, 0, sizeof(g_rops));
+}
+
+struct spdk_store_engine *
+store_engine_create(void)
+{
+	struct spdk_store_engine *e = calloc(1, sizeof(*e));
+	if (e == NULL) { return NULL; }
+	e->shm_fd = e->lease_fd = e->maintenance_fd = e->startup_fd = e->gc_fd = -1;
+	e->worker_slot = -1;
+	e->layers = 27;
+	e->shard_kb = 144;
+	e->seed = 1;
+	e->healthy = 1;
+	int rc = pthread_mutex_init(&e->reactor_mu, NULL);
+	if (rc != 0) { goto fail; }
+	rc = pthread_cond_init(&e->reactor_paused_cv, NULL);
+	if (rc != 0) { goto fail_mu; }
+	rc = pthread_cond_init(&e->reactor_resume_cv, NULL);
+	if (rc != 0) { goto fail_paused; }
+	rc = pthread_mutex_init(&e->gc_mu, NULL);
+	if (rc != 0) { goto fail_resume; }
+	rc = pthread_cond_init(&e->gc_cv, NULL);
+	if (rc != 0) { goto fail_gc; }
+	pthread_mutex_lock(&process_mu);
+	e->next = process_engines;
+	process_engines = e;
+	pthread_mutex_unlock(&process_mu);
+	return e;
+fail_gc:
+	pthread_mutex_destroy(&e->gc_mu);
+fail_resume:
+	pthread_cond_destroy(&e->reactor_resume_cv);
+fail_paused:
+	pthread_cond_destroy(&e->reactor_paused_cv);
+fail_mu:
+	pthread_mutex_destroy(&e->reactor_mu);
+fail:
+	free(e);
+	errno = rc;
+	return NULL;
+}
+
+struct spdk_store_engine *
+store_engine_select(struct spdk_store_engine *engine)
+{
+	struct spdk_store_engine *previous = current_engine;
+	current_engine = engine;
+	return previous;
+}
+
+int
+store_engine_set_cpu_affinity(const int *cores, uint32_t count)
+{
+	if (ENGINE->initialized || g_reactor_started) { return -EBUSY; }
+	if (count && cores == NULL) { return -EINVAL; }
+	cpu_set_t mask;
+	CPU_ZERO(&mask);
+	for (uint32_t i = 0; i < count; i++) {
+		if (cores[i] < 0 || cores[i] >= CPU_SETSIZE) { return -EINVAL; }
+		CPU_SET(cores[i], &mask);
+	}
+	ENGINE->reactor_affinity = mask;
+	ENGINE->reactor_affinity_set = count != 0;
+	return 0;
+}
+
+int
+store_engine_set_direct_only(int enabled)
+{
+	pthread_mutex_lock(&process_mu);
+	int rc = ENGINE->initialized || g_qpair != NULL || g_reactor_started ? -EBUSY : 0;
+	if (rc == 0) { g_direct_only = !!enabled; }
+	pthread_mutex_unlock(&process_mu);
+	return rc;
+}
+
+void
+store_engine_destroy(struct spdk_store_engine *engine)
+{
+	if (engine == NULL || engine == &default_engine) { return; }
+	struct spdk_store_engine *previous = store_engine_select(engine);
+	pthread_mutex_lock(&process_mu);
+	store_device_cleanup();
+	struct spdk_store_engine **p = &process_engines;
+	while (*p != engine) { p = &(*p)->next; }
+	*p = engine->next;
+	pthread_mutex_unlock(&process_mu);
+	current_engine = previous == engine ? NULL : previous;
+	pthread_cond_destroy(&engine->gc_cv);
+	pthread_mutex_destroy(&engine->gc_mu);
+	pthread_cond_destroy(&engine->reactor_resume_cv);
+	pthread_cond_destroy(&engine->reactor_paused_cv);
+	pthread_mutex_destroy(&engine->reactor_mu);
+	free(engine);
 }
 
 /*
@@ -4639,9 +4867,10 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 {
 	struct spdk_env_opts opts;
 	int rc;
-	int env_started = 0;
 	cpu_set_t caller_cpus;
 	int same_session = 0;
+	const char *stage = "environment";
+	if (ENGINE->initialized) { return -EALREADY; }
 
 	if (session != NULL && (session[0] == '\0' || strlen(session) >= STORE_SESSION_SIZE)) {
 		return -EINVAL;
@@ -4657,63 +4886,72 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 	if (g_layers == 0 || g_layers > 256 || g_shard_kb == 0) {
 		return -EINVAL;
 	}
-	if (g_shard_kb * 1024 % 512 != 0) {
+	if ((uint64_t)g_shard_kb * 1024 * g_layers / 512 > UINT32_MAX ||
+	    g_offset_gib > UINT64_MAX / (1024ULL * 1024 * 1024)) {
 		return -EINVAL;
 	}
 
 	/* Wait before creating a controller: no admin poller services keep-alive
 	 * while another process owns startup. Keep the gate until reactor start. */
+	rc = store_parse_region(trid_str, offset_gib);
+	if (rc != 0) { return rc; }
 	rc = store_maintenance_open(g_format && session == NULL);
 	if (rc != 0) {
 		return rc;
 	}
+	pthread_mutex_lock(&process_mu);
 
-	/* 2. SPDK env (idempotent — second call is a no-op if same opts) */
-	opts.opts_size = sizeof(opts);
-	spdk_env_opts_init(&opts);
-	opts.name = "ucm_spdk_store";
-	if (geteuid() != 0) {
-		/* No pagemap access without root: DPDK cannot use physical
-		 * addresses. Virtual-address IOVA is the standard mode for
-		 * RDMA (ibv_reg_mr maps VA directly); direct PCIe keeps the
-		 * PA default and is root-only anyway (vfio). */
-		opts.iova_mode = "va";
-	}
-	/* DPDK pins its main lcore (CPU 0 by default). This thread belongs to
-	 * vLLM, and subsequent Cache/reactor threads inherit its affinity. */
-	if (sched_getaffinity(0, sizeof(caller_cpus), &caller_cpus) != 0) {
-		rc = -errno;
-		goto fail;
-	}
-	int env_rc = spdk_env_init(&opts);
-	env_started = env_rc >= 0;
-	if (sched_setaffinity(0, sizeof(caller_cpus), &caller_cpus) != 0) {
-		rc = -errno;
-		goto fail;
-	}
-	if (env_rc < 0) {
-		rc = -ENOMEM;
-		goto fail;
-	}
-
-	/* 3. parse trid */
-	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
-	snprintf(g_trid.traddr, sizeof(g_trid.traddr), "0000:84:00.0");
-	snprintf(g_trid.subnqn, sizeof(g_trid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
-	if (trid_str != NULL && trid_str[0] != '\0') {
-		if (spdk_nvme_transport_id_parse(&g_trid, trid_str) != 0) {
-			rc = -EINVAL;
+	/* 2. Initialize the process environment exactly once. */
+	if (!process_env_ready) {
+		opts.opts_size = sizeof(opts);
+		spdk_env_opts_init(&opts);
+		opts.name = "ucm_spdk_store";
+		if (geteuid() != 0) {
+			/* RDMA supports VA IOVA without root's pagemap access. */
+			opts.iova_mode = "va";
+		}
+		/* DPDK pins its main lcore. Restore the host thread's affinity. */
+		if (sched_getaffinity(0, sizeof(caller_cpus), &caller_cpus) != 0) {
+			rc = -errno;
+			goto fail;
+		}
+		int env_rc = spdk_env_init(&opts);
+		process_env_ready = env_rc >= 0;
+		if (sched_setaffinity(0, sizeof(caller_cpus), &caller_cpus) != 0) {
+			rc = -errno;
+			goto fail;
+		}
+		if (env_rc < 0) {
+			rc = env_rc;
 			goto fail;
 		}
 	}
+
 	/* 4. probe */
-	rc = spdk_nvme_probe(&g_trid, NULL, probe_cb, attach_cb, NULL);
-	if (rc != 0 || g_ctrlr == NULL || g_ns == NULL) {
+	stage = "controller";
+	struct engine_controller *c;
+	for (c = process_controllers; c != NULL; c = c->next) {
+		if (spdk_nvme_transport_id_compare(&c->trid, &g_trid) == 0) { break; }
+	}
+	if (c == NULL) {
+		c = calloc(1, sizeof(*c));
+		if (c == NULL) { rc = -ENOMEM; goto fail; }
+		c->ctrlr = spdk_nvme_connect(&g_trid, NULL, 0);
+		if (c->ctrlr == NULL) { free(c); rc = -ENODEV; goto fail; }
+		c->trid = g_trid;
+		c->next = process_controllers;
+		process_controllers = c;
+	}
+	c->refs++;
+	ENGINE->controller = c;
+	attach_cb(ENGINE, &g_trid, c->ctrlr, NULL);
+	if (g_ns == NULL) {
 		rc = -ENODEV;
 		goto fail;
 	}
 
 	/* 5. geometry */
+	stage = "geometry";
 	g_sector_size = spdk_nvme_ns_get_sector_size(g_ns);
 	g_num_sectors = spdk_nvme_ns_get_num_sectors(g_ns);
 	if (g_sector_size == 0 || ((uint64_t)g_shard_kb * 1024) % g_sector_size != 0) {
@@ -4727,10 +4965,6 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 	g_index_slots = (uint32_t)(INDEX_RESERVED_BYTES / g_sector_size);
 	g_index_base = g_data_base + 1;
 	g_pool_base = g_index_base + g_index_slots;
-	g_recov_batch = RECOV_BATCH_MAX;
-	if (g_shard_sectors < g_recov_batch) {
-		g_recov_batch = g_shard_sectors;
-	}
 
 	if (g_data_base + 1 + g_index_slots >= g_num_sectors) {
 		rc = -ENOMEM;
@@ -4742,6 +4976,7 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 		g_pool_capacity = pool_sectors / g_slot_sectors;
 	}
 	build_shm_names();
+	stage = "region-lease";
 	rc = store_lease_open();
 	if (rc != 0) {
 		goto fail;
@@ -4754,63 +4989,25 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 			g_format = 0;
 			printf("Format already completed for service session %s; joining.\n", session);
 		} else if (!g_shm_recovery_owner || store_maintenance_upgrade() != 0) {
-			fprintf(stderr, "format requires all previous SPDK store processes to exit\n");
+			fprintf(stderr, "format requires all previous attachments of this region to exit\n");
 			rc = -EBUSY;
 			goto fail;
 		}
 	}
 
 	/* 6. qpair + buffers */
-	{
-		struct spdk_nvme_io_qpair_opts qopts;
-		uint32_t max_xfer = spdk_nvme_ns_get_max_io_xfer_size(g_ns);
-		uint32_t split = (shard_bytes() + max_xfer - 1) / max_xfer;
-		uint32_t need = IO_POOL_BUFS * split + NUM_IDX_BUFS + 16;
-
-		spdk_nvme_ctrlr_get_default_io_qpair_opts(g_ctrlr, &qopts, sizeof(qopts));
-		if (need > qopts.io_queue_size) {
-			qopts.io_queue_size = (need > 1024) ? 1024 : need;
-		}
-		if (qopts.io_queue_requests < 16384) {
-			qopts.io_queue_requests = 16384;
-		}
-		g_qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, &qopts, sizeof(qopts));
-	}
-	if (g_qpair == NULL) {
-		rc = -ENOMEM;
-		goto fail;
-	}
-
-	g_io_bufs = calloc(IO_POOL_BUFS, sizeof(void *));
-	g_idx_bufs = calloc(NUM_IDX_BUFS, sizeof(void *));
-	if (g_io_bufs == NULL || g_idx_bufs == NULL) {
-		rc = -ENOMEM;
-		goto fail;
-	}
-	for (int i = 0; i < IO_POOL_BUFS; i++) {
-		g_io_bufs[i] = spdk_zmalloc(shard_bytes(), 4096, NULL,
-					    SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
-		if (g_io_bufs[i] == NULL) {
-			rc = -ENOMEM;
-			goto fail;
-		}
-		g_io_free[g_io_free_top++] = (uint32_t)i;
-	}
-	for (int i = 0; i < NUM_IDX_BUFS; i++) {
-		g_idx_bufs[i] = spdk_zmalloc(g_sector_size, 4096, NULL,
-					     SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
-		if (g_idx_bufs[i] == NULL) {
-			rc = -ENOMEM;
-			goto fail;
-		}
-		g_idx_free[g_idx_free_top++] = (uint32_t)i;
-	}
+	stage = "io-pool";
+	process_reactors_pause(1);
+	rc = store_io_pool_init();
+	process_reactors_pause(0);
+	if (rc != 0) { goto fail; }
 
 	/* 7. region resolution / SHM / recovery
 	 * The store serves the runtime model geometry: a geometry change
 	 * (model switch) invalidates all existing blocks in place instead
 	 * of refusing to boot. */
 	g_last_progress = spdk_get_ticks();
+	stage = "region-resolution";
 	if (same_session) {
 		struct superblock sb;
 
@@ -4825,6 +5022,7 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 	rc = store_resolve_region();
 	if (rc != 0) { goto fail; }
 
+	stage = "shared-index";
 	if (shm_open_segment(0, 0) != 0) {
 		rc = shm_open_segment(1, 0);
 		if (rc == -EEXIST) {
@@ -4836,6 +5034,7 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 		}
 	}
 
+	stage = "index-recovery";
 	if (g_shm_recovery_owner || g_shm_created) {
 		g_shm_recovering = 1;
 		rc = store_recover();
@@ -4847,6 +5046,7 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 	if (rc != 0) { goto fail; }
 
 	/* 8. reactor */
+	stage = "reactor";
 	rc = reactor_start();
 	if (rc != 0) { goto fail; }
 	if (format) {
@@ -4857,14 +5057,16 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 		}
 	}
 	store_startup_close(&g_startup_fd);
-
+	ENGINE->initialized = 1;
+	pthread_mutex_unlock(&process_mu);
 	return 0;
 
 fail:
+	fprintf(stderr, "SPDK init failed pid=%ld region=%s offset_gib=%ju "
+		"stage=%s rc=%d (%s)\n", (long)getpid(), g_shm_name,
+		(uintmax_t)g_offset_gib, stage, rc, strerror(-rc));
 	store_device_cleanup();
-	if (env_started) {
-		spdk_env_fini();
-	}
+	pthread_mutex_unlock(&process_mu);
 	return rc;
 }
 
@@ -4889,8 +5091,26 @@ store_engine_init_for_session(const char *trid_str, uint32_t nslots_req,
 void
 store_engine_fini(void)
 {
+	pthread_mutex_lock(&process_mu);
 	store_device_cleanup();
-	spdk_env_fini();
+	pthread_mutex_unlock(&process_mu);
+}
+
+int
+store_reactor_start_public(void)
+{
+	pthread_mutex_lock(&process_mu);
+	int rc = reactor_start();
+	pthread_mutex_unlock(&process_mu);
+	return rc;
+}
+
+void
+store_reactor_stop_public(void)
+{
+	pthread_mutex_lock(&process_mu);
+	reactor_stop();
+	pthread_mutex_unlock(&process_mu);
 }
 
 /* Scheduler role: no device, qpair or reactor; attach the worker-built
@@ -4900,6 +5120,7 @@ int
 store_lookup_init(void)
 {
 	int rc;
+	if (ENGINE->initialized) { return -EALREADY; }
 
 	build_shm_names();
 	rc = store_maintenance_open(0);
@@ -4924,20 +5145,16 @@ store_lookup_init(void)
 		store_maintenance_close();
 	}
 	store_startup_close(&g_startup_fd);
+	if (rc == 0) { ENGINE->initialized = 1; }
 	return rc;
 }
 
 int
 store_lookup_init_region(const char *trid_str, uint64_t offset_gib)
 {
-	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
-	snprintf(g_trid.traddr, sizeof(g_trid.traddr), "0000:84:00.0");
-	snprintf(g_trid.subnqn, sizeof(g_trid.subnqn), "%s", SPDK_NVMF_DISCOVERY_NQN);
-	if (trid_str != NULL && trid_str[0] != '\0' &&
-	    spdk_nvme_transport_id_parse(&g_trid, trid_str) != 0) {
-		return -EINVAL;
-	}
-	g_offset_gib = offset_gib;
+	if (ENGINE->initialized) { return -EALREADY; }
+	int rc = store_parse_region(trid_str, offset_gib);
+	if (rc != 0) { return rc; }
 	return store_lookup_init();
 }
 
@@ -4947,15 +5164,16 @@ store_lookup_fini(void)
 	shm_close_segment();
 	store_lease_close();
 	store_maintenance_close();
+	ENGINE->initialized = 0;
 }
 
 /* Public accessors for the .so wrapper (engine_shim.c) */
-uint64_t store_live_count(void) { return g_live_count; }
+uint64_t store_live_count(void) { return g_shm ? g_live_count : 0; }
 uint32_t store_nslots(void) { return g_nslots; }
 uint32_t store_slot_sectors(void) { return g_slot_sectors; }
 uint32_t store_sector_size(void) { return g_sector_size; }
 int store_is_healthy(void) { return g_healthy; }
-uint64_t store_epoch_value(void) { return g_epoch; }
+uint64_t store_epoch_value(void) { return g_shm ? g_epoch : 0; }
 int
 store_gc_public(int max_victims)
 {
@@ -5030,6 +5248,11 @@ main(int argc, char **argv)
 		fprintf(stderr, "invalid layers/shard size\n");
 		return 1;
 	}
+	if ((uint64_t)g_shard_kb * 1024 * g_layers / 512 > UINT32_MAX ||
+	    g_offset_gib > UINT64_MAX / (1024ULL * 1024 * 1024)) {
+		fprintf(stderr, "geometry/offset overflow\n");
+		return 1;
+	}
 	if (g_nslots > 10000000u) {
 		fprintf(stderr, "invalid slot count\n");
 		return 1;
@@ -5063,6 +5286,7 @@ main(int argc, char **argv)
 	}
 
 	/* As in library init, wait for startup before connecting to the target. */
+	build_shm_names();
 	rc = store_maintenance_open(g_format);
 	if (rc != 0) {
 		fprintf(stderr, "store maintenance lease failed (%d)\n", rc);
@@ -5091,7 +5315,7 @@ main(int argc, char **argv)
 
 	g_sector_size = spdk_nvme_ns_get_sector_size(g_ns);
 	g_num_sectors = spdk_nvme_ns_get_num_sectors(g_ns);
-	if ((uint64_t)g_shard_kb * 1024 % g_sector_size != 0) {
+	if (g_sector_size == 0 || (uint64_t)g_shard_kb * 1024 % g_sector_size != 0) {
 		fprintf(stderr, "shard size not sector-aligned\n");
 		rc = 1;
 		goto exit_fini;
@@ -5103,10 +5327,6 @@ main(int argc, char **argv)
 	g_index_slots = (uint32_t)(INDEX_RESERVED_BYTES / g_sector_size);
 	g_index_base = g_data_base + 1;
 	g_pool_base = g_index_base + g_index_slots;
-	g_recov_batch = RECOV_BATCH_MAX;
-	if (g_shard_sectors < g_recov_batch) {
-		g_recov_batch = g_shard_sectors;
-	}
 
 	if (g_data_base + 1 + g_index_slots >= g_num_sectors) {
 		fprintf(stderr, "metadata reservation (%lu MiB) does not fit "
@@ -5129,54 +5349,9 @@ main(int argc, char **argv)
 		g_pool_capacity = pool_sectors / g_slot_sectors;
 	}
 
-	{
-		struct spdk_nvme_io_qpair_opts qopts;
-		uint32_t max_xfer = spdk_nvme_ns_get_max_io_xfer_size(g_ns);
-		uint32_t split = (shard_bytes() + max_xfer - 1) / max_xfer;
-		uint32_t need = IO_POOL_BUFS * split + NUM_IDX_BUFS + 16;
-
-		spdk_nvme_ctrlr_get_default_io_qpair_opts(g_ctrlr, &qopts, sizeof(qopts));
-		if (need > qopts.io_queue_size) {
-			qopts.io_queue_size = (need > 1024) ? 1024 : need;
-		}
-		if (qopts.io_queue_requests < 16384) {
-			qopts.io_queue_requests = 16384;
-		}
-		g_qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, &qopts, sizeof(qopts));
-	}
-	if (g_qpair == NULL) {
-		fprintf(stderr, "alloc_io_qpair failed\n");
-		rc = 1;
-		goto exit_fini;
-	}
-
-	g_io_bufs = calloc(IO_POOL_BUFS, sizeof(void *));
-	g_idx_bufs = calloc(NUM_IDX_BUFS, sizeof(void *));
-	if (g_io_bufs == NULL || g_idx_bufs == NULL) {
-		fprintf(stderr, "buffer array alloc failed\n");
+	if (store_io_pool_init() != 0) {
 		rc = 1;
 		goto exit_free;
-	}
-
-	for (i = 0; i < IO_POOL_BUFS; i++) {
-		g_io_bufs[i] = spdk_zmalloc(shard_bytes(), 4096, NULL,
-					    SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
-		if (g_io_bufs[i] == NULL) {
-			fprintf(stderr, "io buffer alloc failed at %d\n", i);
-			rc = 1;
-			goto exit_free;
-		}
-		g_io_free[g_io_free_top++] = (uint32_t)i;
-	}
-	for (i = 0; i < NUM_IDX_BUFS; i++) {
-		g_idx_bufs[i] = spdk_zmalloc(g_sector_size, 4096, NULL,
-					     SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
-		if (g_idx_bufs[i] == NULL) {
-			fprintf(stderr, "index buffer alloc failed at %d\n", i);
-			rc = 1;
-			goto exit_free;
-		}
-		g_idx_free[g_idx_free_top++] = (uint32_t)i;
 	}
 
 	/* The store serves the runtime model geometry: a geometry change
@@ -5303,7 +5478,7 @@ main(int argc, char **argv)
 	reactor_stop();
 
 exit_free:
-	for (i = 0; i < IO_POOL_BUFS; i++) {
+	for (i = 0; i < (int)g_bounce_pool_count; i++) {
 		if (g_io_bufs != NULL && g_io_bufs[i] != NULL) {
 			spdk_free(g_io_bufs[i]);
 		}
@@ -5315,6 +5490,12 @@ exit_free:
 	}
 	free(g_io_bufs);
 	free(g_idx_bufs);
+	if (g_meta_buf != NULL) { spdk_free(g_meta_buf); }
+	g_meta_buf = NULL;
+	g_io_bufs = g_idx_bufs = NULL;
+	g_io_free_top = g_io_pool_count = 0;
+	g_bounce_free_top = g_bounce_pool_count = 0;
+	g_idx_free_top = g_recov_batch = 0;
 	shm_close_segment();
 	store_lease_close();
 	store_maintenance_close();
