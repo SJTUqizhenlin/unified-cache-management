@@ -33,7 +33,8 @@
 #       注意 /proc 的 syscw 含大量与 UCM 无关的后台小写入（各 worker ~3k/s 的 8B IPC 写），
 #       文件写次数请以 probe 模式或 UC_DEBUG 日志的 task_count 为准。
 #       aio 引擎注意：libaio(io_submit) 不计入 /proc/<pid>/io（wchar/syscw 对 UCM IO 失明），
-#       脚本会自动检测并提示；probe 模式自动切换到 io_submit 的 iocb 口径。
+#       引擎从实际 YAML 读取（缺字段默认 psync），不按流量猜测；配置无法读取则显示 unknown。
+#       若启动后修改了 YAML，应以启动日志为准；stats 不证明进程已应用新配置。
 
 set -uo pipefail
 
@@ -134,7 +135,7 @@ collect() {
   echo "m.avg_load_ms $(mavg_ms ucm:posix_load_task_duration_ms "$f")"
   echo "m.avg_h2s_bw  $(mavg_ms ucm:posix_h2s_bandwidth_gbps "$f")"
   echo "m.avg_s2h_bw  $(mavg_ms ucm:posix_s2h_bandwidth_gbps "$f")"
-  # Cache 层分解（posix 任务时长 = 纯存储路径，不含 H2D；H2D 在 Cache 层单独计量）
+  # Different task/shard populations: these durations are not an additive decomposition.
   echo "m.cache_load_ms   $(mavg_ms ucm:cache_load_duration_ms "$f")"
   echo "m.cache_dump_ms   $(mavg_ms ucm:cache_dump_duration_ms "$f")"
   echo "m.bkwait_ms       $(mavg_ms ucm:cache_shard_backend_wait_ms "$f")"
@@ -216,23 +217,13 @@ discover_pids() {
 snapshot() {
   echo "════════════ UCM Store Stats @ $(date '+%F %T') ════════════"
   echo "  server: $HOST:$PORT   cache_dir: $CACHE_DIR"
+  echo "  Posix engine (configured): $POSIX_IO_ENGINE | config: ${UCM_CONFIG:-unknown}"
   echo
-  local aio=0
   if fetch_metrics; then
     local v
     declare -A V=()
     while read -r k v; do V[$k]="$v"; done < <(collect)
 
-    # aio 引擎检测：metrics 有大写入但所有进程 wchar 都看不到 → libaio 绕过 /proc io
-    local maxw=0 pw p2
-    if [[ "${V[m.h2s]:-0}" -gt 1000000000 ]]; then
-      for p2 in "${PIDS[@]:-}"; do
-        [[ -z "$p2" ]] && continue
-        pw="${V[p.$p2.wchar]:-0}"
-        (( pw > maxw )) && maxw=$pw
-      done
-      (( maxw < 1000000000 )) && aio=1
-    fi
     echo "── [逻辑层] metrics（累计值）"
     python "$(dirname "${BASH_SOURCE[0]}")/scripts/ucm_metric_summary.py" "$METRICS"
     echo "  Posix 写(host→SSD) : $(fmt_bytes "${V[m.h2s]}")    读(SSD→host): $(fmt_bytes "${V[m.s2h]}")"
@@ -242,14 +233,14 @@ snapshot() {
     echo "  lookup: $(fmt_cnt "${V[m.lookup_q]}") 查询 / $(fmt_cnt "${V[m.lookup_h]}") 命中（$(awk -v h="${V[m.lookup_h]}" -v q="${V[m.lookup_q]}" 'BEGIN{if(q>0)printf "%.1f%%",h/q*100;else print "-"}')）"
     echo "  前缀命中: HBM $(awk -v h="${V[m.hbm_tok]}" -v q="${V[m.qtok]}" 'BEGIN{if(q>0)printf "%.1f%%",h/q*100;else print "-"}') / UCM $(awk -v u="${V[m.ucm_tok]}" -v q="${V[m.qtok]}" 'BEGIN{if(q>0)printf "%.1f%%",u/q*100;else print "-"}')  （query tokens $(fmt_cnt "${V[m.qtok]}")）"
     echo "  任务平均: dump ${V[m.avg_dump_ms]:--}ms @ ${V[m.avg_h2s_bw]:--}GB/s   load ${V[m.avg_load_ms]:--}ms @ ${V[m.avg_s2h_bw]:--}GB/s"
-	echo "  关键路径: save阻塞等待 ${V[m.avg_save_wait_ms]:--}ms（≈0 则 dump 不挡调度）   load排队 ${V[m.avg_load_queue_ms]:--}ms / dump排队 ${V[m.avg_dump_queue_ms]:--}ms"
+    echo "  （带宽为逐 task 有效带宽的算术平均，非设备聚合吞吐；task 时延含排队，不含H2D/D2H）"
+    if [[ "$POSIX_IO_ENGINE" == "aio" ]]; then
+      echo "  AIO Dump 完成可早于异步 rename；task 完成不保证最终文件已可查询，也不代表 fsync 持久化"
+    fi
+	echo "  等待指标: save完成确认 ${V[m.avg_save_wait_ms]:--}ms（- 表示无样本；较小不证明 dump 无反压）   load排队 ${V[m.avg_load_queue_ms]:--}ms / dump排队 ${V[m.avg_dump_queue_ms]:--}ms"
 	echo "  Cache层load: 端到端 ${V[m.cache_load_ms]:--}ms | per-shard 存储等待 ${V[m.bkwait_ms]:--}ms + H2D提交 ${V[m.h2d_submit_ms]:--}ms + H2D收尾 ${V[m.h2d_sync_ms]:--}ms"
 	echo "  Cache层dump: 端到端 ${V[m.cache_dump_ms]:--}ms | mkbuf+D2H提交 ${V[m.mkbuf_ms]:--}ms | D2H同步 ${V[m.d2h_ms]:--}ms（含等计算事件 ${V[m.prereq_ms]:--}ms）"
-	if [[ "${V[m.cache_load_ms]}" != "-" && "${V[m.avg_load_ms]}" != "-" ]]; then
-		awk -v a="${V[m.cache_load_ms]}" -v b="${V[m.avg_load_ms]}" 'BEGIN{
-			printf "  （posix load 任务 %.1fms = 纯存储路径不含H2D；端到端−存储 ≈ %.1fms = Cache串行编排+H2D）\n", b, a-b}'
-	fi
-	echo "  H2D判别: cache_h2d_sync 大⇒H2D是瓶颈；h2d_sync≈0 且存储等待大⇒存储读是瓶颈"
+	echo "  （以上指标样本粒度不同且存在重叠，不可相加/相减；backend wait 是剩余就绪等待，H2D sync 是流收尾等待，不能单独判定瓶颈）"
     if [[ "${V[m.store_cap]:-0}" -gt 0 ]]; then
       echo "  store 容量: $(fmt_bytes "${V[m.store_used]}") / $(fmt_bytes "${V[m.store_cap]}")（$(awk -v u="${V[m.store_used]}" -v c="${V[m.store_cap]}" 'BEGIN{if(c>0)printf "%.1f%%",u/c*100;else print "-"}')）   GC: $( [[ "${V[m.gc_running]}" == "1" ]] && echo 运行中 || echo 空闲 )   健康: $( [[ "${V[m.health]}" == "1" ]] && echo OK || echo 熔断/未知 )"
     fi
@@ -265,9 +256,9 @@ snapshot() {
     echo "── [syscall层] /proc/<pid>/io（仅 EngineCore/Worker，按写入排序）"
     echo "  已隐藏辅助进程 $HIDDEN_PROCESS_COUNT 个；STATS_ALL_PROCESSES=1 可显示全部"
   fi
-  if [[ "$aio" == "1" ]]; then
-    echo "  ⚠ aio 引擎：io_submit 不计入 /proc io，下表仅 IPC 背景流量，UCM 文件 IO 不可见"
-    echo "    （dump worker 识别失效；文件 IO 尺寸/次数请用 probe 模式，自动切 io_submit 口径）"
+  if [[ "$POSIX_IO_ENGINE" == "aio" ]]; then
+    echo "  AIO: /proc rchar/wchar/syscr/syscw 不完整覆盖 libaio 数据 IO；表中仍有权重/日志/IPC等流量"
+    echo "    后端数据量看 metrics，io_submit 请求看 probe；不可凭此表推断 dump worker 或读写吞吐"
   fi
   if [[ ${#PIDS[@]} -gt 0 ]]; then
     printf "  %-10s %-18s %-12s %-18s %-12s %s\n" PID 进程 write字节 write次数 read字节 read次数
@@ -277,7 +268,7 @@ snapshot() {
       comm=$(cat "/proc/$p/comm" 2>/dev/null || echo '?')
       mark=""
       # 标记 dump worker（wchar 显著大于其它进程）
-      [[ "$comm" == VLLM::Worker* && "$wc" -gt 1073741824 ]] && mark="  ← possible dump worker"
+      [[ "$POSIX_IO_ENGINE" == "psync" && "$comm" == VLLM::Worker* && "$wc" -gt 1073741824 ]] && mark="  ← possible dump worker"
       printf "  %-10s %-18s %-18s %-12s %-18s %-12s%s\n" "$p" "${comm:0:17}" "$(fmt_bytes "$wc")" "$(fmt_cnt "$sc")" "$(fmt_bytes "$rc")" "$(fmt_cnt "$rcr")" "$mark"
     done < <(for p in "${PIDS[@]}"; do
         io=$(cat "/proc/$p/io" 2>/dev/null) || continue
@@ -347,17 +338,8 @@ watch() {
       done
       local dsw=0 aio_tag=""
       [[ -n "$toppid" ]] && dsw=$(( ${PREV[p.$toppid.syscw]:-0} - LAST_SW ))
-      # aio 检测：metrics 写入大但 wchar 全员低位 → syscw 增量只剩 IPC
-      local aio=0 maxw=0 pw
-      if (( ${PREV[m.h2s]:-0} > 1000000000 )); then
-        for p in "${PIDS[@]:-}"; do
-          [[ -z "$p" ]] && continue
-          pw="${PREV[p.$p.wchar]:-0}"
-          (( pw > maxw )) && maxw=$pw
-        done
-        (( maxw < 1000000000 )) && aio=1
-      fi
-      [[ "$aio" == "1" ]] && aio_tag="(仅IPC,UCM IO不可见)"
+      [[ "$POSIX_IO_ENGINE" == "aio" ]] && aio_tag="(AIO数据IO不完整；非文件写次数)"
+      [[ "$POSIX_IO_ENGINE" == "unknown" ]] && aio_tag="(引擎未知；非文件写次数)"
 
       # 重算进程列表（worker 可能新增）并刷新 PREV 中的 /proc 键
       discover_pids
@@ -395,34 +377,14 @@ watch() {
 probe() {
   command -v strace >/dev/null || { echo "✗ 需要 strace（sudo -E yum --disablerepo=kubernetes install -y strace）" >&2; exit 1; }
 
-  # aio 检测：metrics 有大写入但 wchar 最大的进程也看不到 → libaio 绕过 /proc io
-  local aio=0 h2s=0 maxw=-1 p io w
+  local h2s=0 p
   if fetch_metrics; then h2s=$(msum ucm:posix_h2s_bytes_total "$METRICS"); fi
-  for p in "${PIDS[@]:-}"; do
-    io=$(cat "/proc/$p/io" 2>/dev/null) || continue
-    w=$(awk '/^wchar:/{print $2}' <<<"$io")
-    if (( ${w:-0}+0 > maxw )); then maxw=${w:-0}; fi
-  done
-  if (( h2s+0 > 1000000000 && maxw+0 < 1000000000 )); then aio=1; fi
-
-  # 目标进程：psync→wchar 最大的（dump worker）；aio→全部 worker（dump 在 rank0、load 各 worker 都有）
+  # Both engines distribute IO across ranks; trace all actual workers.
   local -a TPIDS=()
-  if [[ "$aio" == "1" ]]; then
     for p in "${PIDS[@]:-}"; do
       [[ -z "$p" ]] && continue
       [[ "$(cat "/proc/$p/comm" 2>/dev/null)" == VLLM::Worker* ]] && TPIDS+=("$p")
     done
-    if [[ ${#TPIDS[@]} -eq 0 ]]; then TPIDS=("${PIDS[@]}"); fi
-  else
-    local toppid="" topw=-1
-    for p in "${PIDS[@]:-}"; do
-      [[ "$(cat "/proc/$p/comm" 2>/dev/null)" == VLLM::Worker* ]] || continue
-      io=$(cat "/proc/$p/io" 2>/dev/null) || continue
-      w=$(awk '/^wchar:/{print $2}' <<<"$io")
-      if (( w+0 > topw )); then topw=$w; toppid=$p; fi
-    done
-    [[ -n "$toppid" ]] && TPIDS=("$toppid")
-  fi
   if [[ ${#TPIDS[@]} -eq 0 ]]; then echo "✗ 未找到 vllm 进程" >&2; exit 1; fi
 
   # probe 窗口前后的 metrics 写入量（syscall 与 metrics 交叉对账）
@@ -434,8 +396,7 @@ probe() {
 
   local tmpf
   tmpf=$(mktemp /tmp/ucm_strace_XXXXXX.txt)
-  local mode_desc="psync → pwrite64/pread64"
-  [[ "$aio" == "1" ]] && mode_desc="aio → io_submit iocb + openat"
+  local mode_desc="$POSIX_IO_ENGINE (configured); pread/pwrite + io_submit iocb + openat"
   echo "strace 采样 ${PROBE_SEC}s @ pid ${TPIDS[*]}"
   echo "  （模式: ${mode_desc}，共 ${#TPIDS[@]} 个进程）..."
   timeout "$PROBE_SEC" strace -f -e trace=pwrite64,pread64,write,read,io_submit,io_getevents,openat,close \
@@ -511,7 +472,7 @@ probe() {
         printf "  ── aio 调用: io_submit %d 次（%.1f 次/s）, io_getevents %d 次\n", n_submit, n_submit/t, n_getev
       }
       if (n_open > 0) {
-        printf "  ── 元数据: openat %d 次, close %d 次（open %.1f 次/s；每 block 27 次 open 的开销可见）\n", \
+         printf "  ── 元数据: openat %d 次, close %d 次（open %.1f 次/s；含采样期间非UCM文件操作）\n", \
           n_open, n_close, n_open/t
       }
       printf "  ── 后台读写(非文件, 多为 8B IPC): write %d 次, read %d 次\n", n_w, n_r
@@ -548,6 +509,11 @@ case "$STORE_BACKEND" in
   posix) ;;
   *) echo "ERROR: STORE_BACKEND must be auto, posix or spdk" >&2; exit 2 ;;
 esac
+POSIX_IO_ENGINE=unknown
+if [[ -f "$UCM_CONFIG" ]]; then
+  POSIX_IO_ENGINE=$(python3 "$STATS_HELPER" --config "$UCM_CONFIG" --posix-engine) || POSIX_IO_ENGINE=unknown
+fi
+echo "Posix engine (configured): $POSIX_IO_ENGINE; startup logs determine the running engine if YAML changed after launch."
 case "$MODE" in
   watch)     watch ;;
   probe)     probe ;;

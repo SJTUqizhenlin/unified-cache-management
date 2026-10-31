@@ -37,6 +37,15 @@ class SpdkStatsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             stats.backend({"store_pipeline": "Fake"})
 
+    def test_posix_engine_from_configuration_not_traffic(self):
+        config = {"store_pipeline": "Cache|Posix"}
+        self.assertEqual(stats.posix_engine(config), "psync")
+        self.assertEqual(stats.posix_engine(config | {"posix_io_engine": "aio"}), "aio")
+        with self.assertRaises(ValueError):
+            stats.posix_engine(config | {"posix_io_engine": "invalid"})
+        with self.assertRaises(ValueError):
+            stats.posix_engine(self.config())
+
     def test_local_target_resolved_from_config(self):
         subsystem = {"subtype": "NVMe", "nqn": "nqn.test", "listen_addresses": [
             {"trtype": "RDMA", "traddr": "192.0.2.1", "trsvcid": "4420"}],

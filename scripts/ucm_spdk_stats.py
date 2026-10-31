@@ -34,6 +34,15 @@ def backend(config):
     raise ValueError("unsupported store_pipeline; select STORE_BACKEND explicitly")
 
 
+def posix_engine(config):
+    if backend(config) != "posix":
+        raise ValueError("configuration is not a Posix pipeline")
+    engine = config.get("posix_io_engine", "psync")
+    if engine not in ("psync", "aio"):
+        raise ValueError(f"unsupported posix_io_engine: {engine!r}")
+    return engine
+
+
 def rpc(method, *args):
     script = os.environ.get(
         "SPDK_RPC", str(Path(os.environ.get("SPDK_ROOT_DIR", str(Path.home() / "devSPDK/spdk"))) / "scripts/rpc.py")
@@ -165,6 +174,7 @@ def main():
     parser.add_argument("--pid")
     parser.add_argument("--config-path", action="store_true")
     parser.add_argument("--detect", action="store_true")
+    parser.add_argument("--posix-engine", action="store_true")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default="7780")
     parser.add_argument("--mode", choices=("snapshot", "watch", "probe"), default="snapshot")
@@ -181,6 +191,9 @@ def main():
             print(config.get("kv_connector_extra_config", {}).get("UCM_CONFIG_FILE", ""))
         return
     config = load_config(args.config)
+    if args.posix_engine:
+        print(posix_engine(config))
+        return
     if args.detect:
         print(backend(config))
         return
