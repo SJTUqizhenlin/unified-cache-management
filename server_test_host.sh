@@ -10,8 +10,9 @@
 #      - 缓存目录必须位于 $HOME 下且属主为本人，才允许清空
 #   5. 修正 pod 硬编码路径（UCM_CONFIG_FILE），配置文件首次自动生成、之后可手工编辑
 #   6. TP 数量自动跟随 DEVICES 数量；启动前预检 6 步（残留自检/构建新旧/Python/模型/端口/UCM 配置）
-#      残留自检 = 关服三查的前置版：自动清理上次崩溃遗留的孤儿进程（PPID=1 的 worker，
-#      会占卡导致启动失败）与未映射的 shm 泄漏；HBM 被占则提前报错而不是让 vllm 崩
+#      残留自检 = 关服三查的前置版：默认保留已有孤儿进程、不杀任何已有 NPU 进程；
+#      所选 NPU 被占用时，每隔 NPU_BUSY_RETRY_SECONDS（默认 1800s）重试，直到释放。
+#      KILL_ORPHANS=1 可恢复旧的孤儿进程清理；NPU_BUSY_MAX_RETRIES 可限制重试次数。
 #      构建新旧检查 = C++/构建文件 mtime 新于最新 .so 时自动重编译（覆盖 unstaged 编辑 /
 #      git pull / 切分支三种过期场景）；SKIP_REBUILD=1 跳过；--ucm off 时只提示不重编
 #
@@ -20,6 +21,7 @@
 #
 # 环境变量覆盖（例如同时起一个 "plus" 对比实例）：
 #   DEVICES=1,3,5,7 PORT=7880 CACHE_DIR=~/ucm-cache/test-plus ./server_test_host.sh
+#   NPU_BUSY_RETRY_SECONDS=1800 NPU_BUSY_MAX_RETRIES=0 KILL_ORPHANS=0 ./server_test_host.sh
 
 # ---------------- 可调参数 ----------------
 UCM_ENABLED=1
@@ -31,6 +33,13 @@ PORT="${PORT:-7780}"
 REPO="$HOME/devA2/unified-cache-management"
 # 配置文件放在缓存目录外（避免被清空逻辑误删），按缓存目录名隔离
 UCM_CONFIG="$HOME/ucm-cache/ucm_config_$(basename "${CACHE_DIR%/}").yaml"
+# NPU 占用策略：
+#   KILL_ORPHANS=0            默认不杀任何已有 NPU 进程（包括上次崩溃遗留的孤儿进程）
+#   NPU_BUSY_RETRY_SECONDS    所选 NPU 被占用时的重试间隔，默认 1800s
+#   NPU_BUSY_MAX_RETRIES      重试次数上限；0 表示一直等，直到 NPU 释放
+KILL_ORPHANS="${KILL_ORPHANS:-0}"
+NPU_BUSY_RETRY_SECONDS="${NPU_BUSY_RETRY_SECONDS:-1800}"
+NPU_BUSY_MAX_RETRIES="${NPU_BUSY_MAX_RETRIES:-0}"
 
 usage() {
   echo "Usage: $0 [--ucm on|off]"
@@ -86,12 +95,23 @@ cd "$REPO"
 
 set -euo pipefail
 
+if ! [[ "$NPU_BUSY_RETRY_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: NPU_BUSY_RETRY_SECONDS 必须是正整数（秒），当前: $NPU_BUSY_RETRY_SECONDS" >&2
+  exit 2
+fi
+if ! [[ "$NPU_BUSY_MAX_RETRIES" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: NPU_BUSY_MAX_RETRIES 必须是非负整数，当前: $NPU_BUSY_MAX_RETRIES" >&2
+  exit 2
+fi
+
 TP=$(awk -F',' '{print NF}' <<< "$DEVICES")
 
 # ---------------- 预检 ----------------
-echo "==> [1/6] 上次实例残留自检（Ctrl+C 崩溃可能遗留孤儿进程 / shm / 占卡）"
+echo "==> [1/6] 上次实例残留自检（默认保留已有进程；shm / 占卡检查）"
+echo "    NPU 占用策略: KILL_ORPHANS=${KILL_ORPHANS}，BUSY 时间隔 ${NPU_BUSY_RETRY_SECONDS}s 重试（上限 ${NPU_BUSY_MAX_RETRIES}，0=一直等）"
 
-# a) 孤儿进程清理：本用户属主 + PPID=1（父进程已死被 init 接管）的 vllm worker/EngineCore/resource_tracker
+# a) 孤儿进程检查：本用户属主 + PPID=1（父进程已死被 init 接管）的 vllm worker/EngineCore/resource_tracker
+#    默认只报告不清理（KILL_ORPHANS=0）；设 KILL_ORPHANS=1 才恢复旧的 SIGTERM/SIGKILL 清理
 #    活着的 worker 父进程一定是 EngineCore，PPID=1 即为上次崩溃的残留，会占着 NPU 卡导致本次启动失败
 ORPHANS=$(ps -eo pid=,ppid=,uid=,comm=,args= 2>/dev/null | awk -v uid="$(id -u)" '
   $3 == uid && $2 == 1 {
@@ -99,20 +119,25 @@ ORPHANS=$(ps -eo pid=,ppid=,uid=,comm=,args= 2>/dev/null | awk -v uid="$(id -u)"
     else if (index($0, "resource_tracker") > 0) print $1
   }') || ORPHANS=""
 if [[ -n "$ORPHANS" ]]; then
-  echo "    发现上次残留的孤儿进程，正在清理: $(echo $ORPHANS | tr '\n' ' ')"
-  kill $ORPHANS 2>/dev/null || true
-  for i in $(seq 1 10); do
-    ALIVE=""
-    for p in $ORPHANS; do [[ -d /proc/$p ]] && ALIVE="$ALIVE $p"; done
-    [[ -z "$ALIVE" ]] && break
-    sleep 1
-  done
-  if [[ -n "${ALIVE:-}" ]]; then
-    echo "    SIGTERM 未退出，升级 SIGKILL:$ALIVE"
-    kill -9 $ALIVE 2>/dev/null || true
-    sleep 2
+  if [[ "$KILL_ORPHANS" == "1" ]]; then
+    echo "    发现上次残留的孤儿进程，正在清理: $(echo $ORPHANS | tr '\n' ' ')"
+    kill $ORPHANS 2>/dev/null || true
+    for i in $(seq 1 10); do
+      ALIVE=""
+      for p in $ORPHANS; do [[ -d /proc/$p ]] && ALIVE="$ALIVE $p"; done
+      [[ -z "$ALIVE" ]] && break
+      sleep 1
+    done
+    if [[ -n "${ALIVE:-}" ]]; then
+      echo "    SIGTERM 未退出，升级 SIGKILL:$ALIVE"
+      kill -9 $ALIVE 2>/dev/null || true
+      sleep 2
+    fi
+    echo "    ✓ 孤儿进程已清理"
+  else
+    echo "    发现上次残留的孤儿进程（KILL_ORPHANS=0，保留不杀）: $(echo $ORPHANS | tr '\n' ' ')"
+    echo "    若它们占用所选 NPU，后续将等待 NPU 释放后重试；需要清理请设 KILL_ORPHANS=1"
   fi
-  echo "    ✓ 孤儿进程已清理"
 else
   echo "    ✓ 无孤儿进程"
 fi
@@ -144,12 +169,37 @@ if [[ "$SHM_STALE" == "1" ]]; then
 fi
 ls /dev/shm/uc_shm_cache* >/dev/null 2>&1 || echo "    ✓ /dev/shm 无 uc_shm_cache 残留"
 
-# c) 所选 NPU 的 HBM 基线检查（基线约 3.4GB；>8GB 视为被占用 → 本实例必然启动失败，提前报错）
+# c) 所选 NPU 的 HBM 基线检查（基线约 3.4GB；>8GB 视为被占用）
 #    注：npu-smi 表格中每张卡两行 —— 第一行含 NPU 编号，第二行（含 Bus-Id）才有 HBM
-if ! npu-smi info | python "$REPO/scripts/check_npu_hbm.py" --devices "$DEVICES"; then
-  echo "ERROR: NPU 占用预检未通过；请确认 npu-smi 输出、设备编号或等待占用释放" >&2
-  exit 1
-fi
+#    默认不杀占用者：BUSY 时按 NPU_BUSY_RETRY_SECONDS 等待后重试；
+#    NPU_BUSY_MAX_RETRIES=0 表示一直等到释放。非 BUSY 的检查/解析错误立即退出。
+NPU_RETRY=0
+while :; do
+  # set -e 下不能直接捕获非零退出码，先关闭 errexit 再执行检查
+  set +e
+  HBM_OUTPUT=$(npu-smi info 2>&1 | python "$REPO/scripts/check_npu_hbm.py" --devices "$DEVICES" 2>&1)
+  HBM_RC=$?
+  set -e
+  echo "$HBM_OUTPUT"
+
+  if [[ "$HBM_RC" == "0" ]]; then
+    break
+  fi
+
+  if [[ "$HBM_OUTPUT" != *"BUSY"* ]]; then
+    echo "ERROR: NPU 占用预检失败（非 BUSY，可能是 npu-smi 输出或设备编号错误）；不重试" >&2
+    exit 1
+  fi
+
+  NPU_RETRY=$((NPU_RETRY + 1))
+  if (( NPU_BUSY_MAX_RETRIES > 0 && NPU_RETRY > NPU_BUSY_MAX_RETRIES )); then
+    echo "ERROR: NPU 仍被占用，已达到重试上限 ${NPU_BUSY_MAX_RETRIES} 次；退出" >&2
+    exit 1
+  fi
+  echo "    NPU 被占用，${NPU_BUSY_RETRY_SECONDS}s 后重试（第 ${NPU_RETRY} 次）..."
+  sleep "$NPU_BUSY_RETRY_SECONDS"
+done
+echo "    ✓ 所选 NPU 已释放，继续启动"
 
 echo "==> [2/6] UCM 构建新旧检查（源码 mtime vs 编译产物 .so）"
 # 规则：C++/构建文件的时间戳新于最新 .so → 需要重编（覆盖 unstaged 编辑 / pull / 切分支三种情况）

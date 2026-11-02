@@ -22,6 +22,18 @@ BDEV=Nvme0
 TRADDR=${2:-192.168.1.12}
 TRSVCID=${3:-4420}
 
+# Target-side iobuf sizing. UCM shards are typically 3-6 MiB:
+#   - max_io_size 8 MiB avoids splitting a shard into many 128 KiB requests
+#     (must be a power of two; MDTS becomes log2(8 MiB / 4 KiB) = 11).
+#   - 1 MiB large buffers keep SGE count <= 8 for an 8 MiB request
+#     (RDMA requires max_io_size / large_bufsize <= 16).
+#   - 2048 buffers is a fixed 2 GiB memory budget. Requests beyond it queue
+#     on iobuf backpressure; they do not grow target memory.
+# Raise IOBUF_LARGE_POOL_COUNT only together with nvmf_tgt -s / hugepages.
+IOBUF_LARGE_BUFSIZE=1048576
+IOBUF_LARGE_POOL_COUNT=2048
+MAX_IO_SIZE=8388608
+
 if [ "$(id -u)" -ne 0 ]; then
 	echo "must run as root (sudo $0 ...)" >&2
 	exit 1
@@ -59,8 +71,8 @@ start() {
 	trap 'rc=$?; echo "start failed, rolling back" >&2; \
 		systemctl stop "$UNIT" 2>/dev/null || true; exit $rc' ERR
 
-	echo "1/5 starting $UNIT (nvmf_tgt -m 0xF0 -s 8192) ..."
-	systemd-run --unit="$UNIT" "$TGT" -m 0xF0 -s 8192
+	echo "1/7 starting $UNIT (nvmf_tgt -m 0xF0 -s 8192 --wait-for-rpc) ..."
+	systemd-run --unit="$UNIT" "$TGT" -m 0xF0 -s 8192 --wait-for-rpc
 	if ! wait_rpc; then
 		journalctl -u "$UNIT" --no-pager -n 30
 		systemctl stop "$UNIT"
@@ -68,23 +80,38 @@ start() {
 		exit 1
 	fi
 
-	echo "2/5 creating RDMA transport (max-queue-depth 1024) ..."
-	"$RPC" nvmf_create_transport -t RDMA -u 4096 --max-queue-depth 1024
+	# iobuf_set_options is a STARTUP-only RPC: it must run before
+	# framework_start_init, and nvmf_create_transport must run after it so
+	# the SGE validation sees the configured large_bufsize.
+	echo "2/7 setting iobuf (${IOBUF_LARGE_POOL_COUNT} x ${IOBUF_LARGE_BUFSIZE} bytes) ..."
+	"$RPC" iobuf_set_options \
+		--large-bufsize "$IOBUF_LARGE_BUFSIZE" \
+		--large-pool-count "$IOBUF_LARGE_POOL_COUNT"
 
-	echo "3/5 attaching backend SSD $PCI_ADDR ..."
+	echo "3/7 initializing subsystems ..."
+	"$RPC" framework_start_init
+
+	echo "4/7 creating RDMA transport (max-queue-depth 1024, max-io-size $MAX_IO_SIZE) ..."
+	"$RPC" nvmf_create_transport -t RDMA -u 4096 \
+		--max-queue-depth 1024 --max-io-size "$MAX_IO_SIZE"
+
+	echo "5/7 attaching backend SSD $PCI_ADDR ..."
 	"$RPC" bdev_nvme_attach_controller -b "$BDEV" -t PCIe -a "$PCI_ADDR"
 
-	echo "4/5 creating subsystem + NS ..."
+	echo "6/7 creating subsystem + NS ..."
 	"$RPC" nvmf_create_subsystem "$SUBSYS_NQN" -a -s "$SERIAL"
 	"$RPC" nvmf_subsystem_add_ns "$SUBSYS_NQN" "${BDEV}n1"
 
-	echo "5/5 adding RDMA listener $TRADDR:$TRSVCID ..."
+	echo "7/7 adding RDMA listener $TRADDR:$TRSVCID ..."
 	"$RPC" nvmf_subsystem_add_listener "$SUBSYS_NQN" -t RDMA -a "$TRADDR" -s "$TRSVCID"
 
 	trap - ERR
 	cat <<EOF
 
 target ready: 84:00.0 now owned by $UNIT (PCIe 直连测试暂停).
+iobuf      : ${IOBUF_LARGE_POOL_COUNT} x ${IOBUF_LARGE_BUFSIZE} bytes (large pool)
+max-io-size: $MAX_IO_SIZE bytes
+check      : sudo $RPC iobuf_get_stats
 connect with e.g.:
   sudo ./nvme_iops_test -r 'trtype:RDMA adrfam:IPv4 traddr:$TRADDR trsvcid:$TRSVCID' -o 144 -S 8 -t 5 -w randread
 teardown:
