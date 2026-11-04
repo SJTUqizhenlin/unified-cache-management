@@ -7,6 +7,8 @@
 #define OP_RING_SIZE 4096
 #define MAX_PENDING OP_RING_SIZE
 
+#include "ucm_spdk_ipc_client.h"
+
 struct reg_range {
 	uint64_t start, end;
 	uint32_t refs;
@@ -18,6 +20,12 @@ struct engine_controller {
 	struct spdk_nvme_ctrlr *ctrlr;
 	unsigned refs;
 	struct engine_controller *next;
+};
+
+#define IPC_BRIDGE_COUNT (IO_POOL_BUFS + NUM_IDX_BUFS + 1)
+struct ipc_cb_bridge {
+	void (*cb)(void *, const struct spdk_nvme_cpl *);
+	void *arg;
 };
 
 struct spdk_store_engine {
@@ -37,6 +45,7 @@ struct spdk_store_engine {
 	int shm_recovery_owner, shm_recovering, region_reset, shm_created;
 	pid_t registered_pid;
 	int worker_slot;
+	_Atomic uint64_t worker_check_after_ns;
 	char shm_name[64], lease_name[64], maintenance_name[80];
 	uint64_t gc_passes, gc_evicted;
 	uint32_t layers, shard_kb;
@@ -63,6 +72,17 @@ struct spdk_store_engine {
 	uint64_t reg_total_bytes;
 	int direct_dma, direct_only;
 	struct spdk_ring *op_ring;
+	int ipc_mode, ipc_ready;
+	struct ucm_ipc_client ipc;
+	struct ipc_cb_bridge ipc_bridges[IPC_BRIDGE_COUNT];
+	uint32_t ipc_bridge_free[IPC_BRIDGE_COUNT], ipc_bridge_free_top;
+	char ipc_socket[128];
+	uint8_t *meta_base;
+	size_t meta_size;
+	int meta_fd;
+	uint8_t *cache_base;
+	size_t cache_size;
+	int cache_fd;
 	pthread_t reactor_tid;
 	_Atomic int reactor_stop;
 	int reactor_pause_req, reactor_paused, reactor_started;
@@ -94,6 +114,7 @@ void store_reactor_stop_public(void);
 static struct spdk_store_engine default_engine = {
 	.shm_fd = -1, .lease_fd = -1, .maintenance_fd = -1, .startup_fd = -1,
 	.gc_fd = -1, .worker_slot = -1, .layers = 27, .shard_kb = 144,
+	.meta_fd = -1, .cache_fd = -1,
 	.seed = 1, .healthy = 1,
 	.reactor_mu = PTHREAD_MUTEX_INITIALIZER,
 	.reactor_paused_cv = PTHREAD_COND_INITIALIZER,
@@ -173,6 +194,16 @@ static _Thread_local struct spdk_store_engine *current_engine;
 #define g_direct_dma (ENGINE->direct_dma)
 #define g_direct_only (ENGINE->direct_only)
 #define g_op_ring (ENGINE->op_ring)
+#define g_ipc_mode (ENGINE->ipc_mode)
+#define g_ipc_ready (ENGINE->ipc_ready)
+#define g_ipc (ENGINE->ipc)
+#define g_ipc_socket (ENGINE->ipc_socket)
+#define g_meta_base (ENGINE->meta_base)
+#define g_meta_size (ENGINE->meta_size)
+#define g_meta_fd (ENGINE->meta_fd)
+#define g_cache_base (ENGINE->cache_base)
+#define g_cache_size (ENGINE->cache_size)
+#define g_cache_fd (ENGINE->cache_fd)
 #define g_reactor_tid (ENGINE->reactor_tid)
 #define g_reactor_stop (ENGINE->reactor_stop)
 #define g_reactor_pause_req (ENGINE->reactor_pause_req)

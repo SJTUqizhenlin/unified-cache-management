@@ -18,12 +18,15 @@
 #
 # 环境变量覆盖：
 #   HOST=127.0.0.1  PORT=7780  CACHE_DIR=~/ucm-cache/test
-#   STORE_BACKEND=auto|posix|spdk  UCM_CONFIG=/path/to/config.yaml
+#   STORE_BACKEND=auto|posix|spdk|empty  UCM_CONFIG=/path/to/config.yaml
 #   STATS_ALL_PROCESSES=1  包含日志、resource tracker、编译等辅助子进程（默认仅 EngineCore/Worker）
 #   SPDK_RPC=/path/to/rpc.py  SPDK_RPC_SOCKET=/var/tmp/spdk.sock
 #   SPDK_BDEV=Nvme0n1  SPDK_RPC_SUDO=1 (default; noninteractive sudo)
-#   SPDK probe uses read-only RPC deltas, not strace. No counters are reset.
+#   SPDK IPC mode reads the local ucm_spdk_ipc_target's built-in counters over
+#   the spdk_trid socket; SPDK_RPC/SPDK_BDEV apply only to NVMe-oF RDMA targets.
+#   SPDK probe uses read-only counters/RPC deltas, not strace. No counters are reset.
 #   SPDK: files/syscalls and unexported Store capacity/GC/health are N/A.
+#   Empty: UCM/Cache metrics only; all modes show cumulative snapshots, no backend IO.
 #
 # 提示：metrics 为累计值；窗口分析用 watch 模式（自动做差分）。
 #       指标在有推理请求时才被 vllm 同步到 /metrics，空闲期数值不动是正常现象。
@@ -56,7 +59,7 @@ while [[ $# -gt 0 ]]; do
     -i)        [[ $# -ge 2 ]] || { echo "ERROR: -i requires seconds" >&2; exit 2; }; INTERVAL="$2"; REPEAT_SNAPSHOT=1; shift ;;
     -n)        [[ $# -ge 2 ]] || { echo "ERROR: -n requires a count" >&2; exit 2; }; MAX_CYCLES="$2"; REPEAT_SNAPSHOT=1; shift ;;
     -t)        PROBE_SEC="$2"; shift ;;
-    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)         echo "未知参数: $1（支持: snapshot | watch [-i 秒] [-n 次] | probe [-t 秒]）" >&2; exit 2 ;;
   esac
   shift
@@ -502,12 +505,13 @@ if [[ "$STORE_BACKEND" == "auto" ]]; then
   fi
 fi
 case "$STORE_BACKEND" in
-  spdk)
+   spdk|empty)
     python3 "$STATS_HELPER" --config "$UCM_CONFIG" --host "$HOST" --port "$PORT" \
+      --backend "$STORE_BACKEND" \
       --mode "$MODE" --interval "$INTERVAL" --cycles "$MAX_CYCLES" --probe-seconds "$PROBE_SEC"
     exit $? ;;
   posix) ;;
-  *) echo "ERROR: STORE_BACKEND must be auto, posix or spdk" >&2; exit 2 ;;
+   *) echo "ERROR: STORE_BACKEND must be auto, posix, spdk or empty" >&2; exit 2 ;;
 esac
 POSIX_IO_ENGINE=unknown
 if [[ -f "$UCM_CONFIG" ]]; then

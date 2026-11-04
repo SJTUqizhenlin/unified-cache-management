@@ -73,7 +73,11 @@ void spdk_store_lookup_fini(void);
 int spdk_store_reactor_start(void);
 void spdk_store_reactor_stop(void);
 int spdk_store_healthy(void);
+int store_register_memory_fd(int fd, void *addr, uint64_t size,
+                             uint64_t file_offset);
 int spdk_store_register_memory(void *addr, uint64_t size);
+int spdk_store_register_memory_fd(int fd, void *addr, uint64_t size,
+                                  uint64_t file_offset);
 int spdk_store_unregister_memory(void *addr, uint64_t size);
 uint64_t spdk_store_registered_bytes(void);
 

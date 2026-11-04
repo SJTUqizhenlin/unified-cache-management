@@ -54,6 +54,16 @@ TEST(UCHealthBreakerStoreTest, StoreV1ProvidesHealthyDefault)
 
 namespace {
 
+class MemoryRegistrationStore : public Detail::MockStore {
+public:
+    MOCK_METHOD(Status, RegisterHostMemory, (void* addr, size_t size), (override));
+    MOCK_METHOD(Status, RegisterHostMemoryFd,
+                (int fd, void* addr, size_t size, uint64_t file_offset), (override));
+    MOCK_METHOD(void, UnregisterHostMemory, (void* addr, size_t size), (override));
+    MOCK_METHOD(void, UnregisterHostMemoryFd,
+                (int fd, void* addr, size_t size, uint64_t file_offset), (override));
+};
+
 StoreHealthConfig TestConfig()
 {
     StoreHealthConfig config;
@@ -392,6 +402,31 @@ TEST(UCHealthBreakerStoreTest, HealthyOperationsPassThroughWithoutChangingWindow
     EXPECT_EQ(breaker.Load({}).Value(), 21);
     EXPECT_CALL(store, Dump(testing::_)).WillOnce(Return(22));
     EXPECT_EQ(breaker.Dump({}).Value(), 22);
+    EXPECT_TRUE(breaker.Enabled());
+    EXPECT_EQ(breaker.SampleCount(), 0);
+    EXPECT_EQ(breaker.FailureCount(), 0);
+}
+
+TEST(UCHealthBreakerStoreTest, HostMemoryFdOperationsPreserveArgumentsAndStatus)
+{
+    StrictMock<MemoryRegistrationStore> store;
+    HealthBreakerStore breaker;
+    ASSERT_TRUE(SetupBreaker(breaker, &store, "cache-0", TestConfig()).Success());
+    StoreV1& base = breaker;
+    std::array<uint8_t, 4096> buffer{};
+    constexpr int fd = 17;
+    constexpr uint64_t offset = (uint64_t{1} << 32) + 4096;
+    const auto error = Status::OsApiError("fd registration rejected");
+
+    EXPECT_CALL(store, RegisterHostMemoryFd(fd, buffer.data(), buffer.size(), offset))
+        .WillOnce(Return(Status::OK()))
+        .WillOnce(Return(error));
+    EXPECT_TRUE(base.RegisterHostMemoryFd(fd, buffer.data(), buffer.size(), offset).Success());
+    EXPECT_EQ(base.RegisterHostMemoryFd(fd, buffer.data(), buffer.size(), offset).ToString(),
+              error.ToString());
+    EXPECT_CALL(store, UnregisterHostMemoryFd(fd, buffer.data(), buffer.size(), offset));
+    base.UnregisterHostMemoryFd(fd, buffer.data(), buffer.size(), offset);
+
     EXPECT_TRUE(breaker.Enabled());
     EXPECT_EQ(breaker.SampleCount(), 0);
     EXPECT_EQ(breaker.FailureCount(), 0);

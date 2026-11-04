@@ -1,0 +1,7 @@
+ucm_spdk_ipc_target
+ucm_spdk_ipc_test
+ucm_spdk_ipc_engine_test
+ipc_protocol_test
+ipc_client_test
+*.o
+*.d

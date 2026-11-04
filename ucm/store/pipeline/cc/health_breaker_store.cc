@@ -154,9 +154,21 @@ Status HealthBreakerStore::RegisterHostMemory(void* addr, size_t size)
     return store_->RegisterHostMemory(addr, size);
 }
 
+Status HealthBreakerStore::RegisterHostMemoryFd(int fd, void* addr, size_t size,
+                                               uint64_t file_offset)
+{
+    return store_->RegisterHostMemoryFd(fd, addr, size, file_offset);
+}
+
 void HealthBreakerStore::UnregisterHostMemory(void* addr, size_t size)
 {
     store_->UnregisterHostMemory(addr, size);
+}
+
+void HealthBreakerStore::UnregisterHostMemoryFd(int fd, void* addr, size_t size,
+                                               uint64_t file_offset)
+{
+    store_->UnregisterHostMemoryFd(fd, addr, size, file_offset);
 }
 
 Expected<Detail::TaskHandle> HealthBreakerStore::Load(Detail::TaskDesc task)

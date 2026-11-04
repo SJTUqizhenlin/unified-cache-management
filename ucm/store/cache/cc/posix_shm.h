@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <string>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "logger/logger.h"
 #include "status/status.h"
@@ -44,19 +45,29 @@ public:
 
 private:
     std::string name_{};
+    std::string dir_{};
     int32_t handle_{-1};
 
 public:
-    PosixShm(std::string name) : name_{std::move(name)} {}
+    PosixShm(std::string name, std::string dir = {})
+        : name_{std::move(name)}, dir_{std::move(dir)}
+    {
+    }
     ~PosixShm()
     {
         if (handle_ != -1) { close(handle_); }
     }
     const std::string& ShmName() { return name_; }
+    int32_t Handle() const { return handle_; }
     Status ShmOpen(const uint32_t flags)
     {
         static constexpr auto NewFilePerm = (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-        handle_ = shm_open(name_.c_str(), flags, NewFilePerm);
+        if (dir_.empty()) {
+            handle_ = shm_open(name_.c_str(), flags, NewFilePerm);
+        } else {
+            auto path = dir_ + "/" + name_;
+            handle_ = open(path.c_str(), flags | O_CLOEXEC, NewFilePerm);
+        }
         auto eno = errno;
         if (handle_ >= 0) { return Status::OK(); }
         if (eno == EEXIST) { return Status::DuplicateKey(); }
@@ -95,7 +106,15 @@ public:
         return Status::OK();
     }
     static void MUnmap(void* addr, size_t size) { munmap(addr, size); }
-    void ShmUnlink() { shm_unlink(name_.c_str()); }
+    void ShmUnlink()
+    {
+        if (dir_.empty()) {
+            shm_unlink(name_.c_str());
+        } else {
+            auto path = dir_ + "/" + name_;
+            unlink(path.c_str());
+        }
+    }
 };
 
 }  // namespace UC::CacheStore

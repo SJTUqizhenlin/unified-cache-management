@@ -53,6 +53,9 @@ STATS_LOG="$RUN_DIR/stats.log"
 SERVER_PID=""
 CLIENT_PID=""
 STATS_PID=""
+SERVER_START_TIME=""
+SERVER_TOKEN=""
+PROCESS_HELPER="$REPO/scripts/host_server_process.py"
 
 usage() {
   echo "Usage: $0"
@@ -125,17 +128,13 @@ cleanup() {
     signal_tree "$CLIENT_PID" KILL
     wait "$CLIENT_PID" 2>/dev/null || true
   fi
-  if pid_alive "$SERVER_PID"; then
-    # server_test_host.sh 最后 exec 成 vllm；先只对 master 发 SIGINT 让它优雅关闭
-    kill -INT "$SERVER_PID" 2>/dev/null || true
-    for _ in $(seq 1 30); do
-      pid_alive "$SERVER_PID" || break
-      sleep 1
-    done
-    if pid_alive "$SERVER_PID"; then
-      signal_tree "$SERVER_PID" TERM
-      sleep 2
-      signal_tree "$SERVER_PID" KILL
+  if [[ -n "$SERVER_PID" && -n "$SERVER_START_TIME" ]]; then
+    # Token discovery also covers descendants after the master has exited.
+    python3 "$PROCESS_HELPER" stop --port "$PORT" \
+      --pid "$SERVER_PID" --start-time "$SERVER_START_TIME" \
+      --token "$SERVER_TOKEN" --grace-seconds 30 || true
+    if ! pid_alive "$SERVER_PID"; then
+      wait "$SERVER_PID" 2>/dev/null || true
     fi
   fi
 
@@ -146,14 +145,8 @@ trap cleanup EXIT INT TERM
 
 server_is_ready() {
   pid_alive "$SERVER_PID" || return 1
-  local comm
-  comm=$(ps -p "$SERVER_PID" -o comm= 2>/dev/null) || return 1
-  # server_test_host.sh 在 exec vllm serve 前是 bash；exec 后 comm 变成 vllm。
-  # 同时确认命令行端口，避免误把端口上的其它实例当成我们启动的 server。
-  if [[ "$comm" != "vllm" ]]; then
-    tr '\0' ' ' < "/proc/$SERVER_PID/cmdline" 2>/dev/null | grep -q 'vllm serve' || return 1
-  fi
-  tr '\0' ' ' < "/proc/$SERVER_PID/cmdline" 2>/dev/null | grep -q -- "--port $PORT" || return 1
+  python3 "$PROCESS_HELPER" identify --port "$PORT" \
+    --pid "$SERVER_PID" --start-time "$SERVER_START_TIME" >/dev/null 2>&1 || return 1
   curl -fsS --max-time 3 "http://$HOST:$PORT/health" >/dev/null 2>&1
 }
 
@@ -217,9 +210,22 @@ wait_client_delay() {
 
 echo "==> [1/3] 启动 server_test_host.sh (PORT=$PORT, DEVICES=${DEVICES:-default})"
 echo "    日志: $SERVER_LOG"
-# server 不套 setsid：它内部可能调用 sudo，需要保留控制终端；正常由 client --stop-server 收尾
-bash "$REPO/server_test_host.sh" >"$SERVER_LOG" 2>&1 &
+# A detached server cannot prompt on a controlling terminal.
+if ! setsid sudo -n true; then
+  echo "ERROR: 后台 server 需要无控制终端的免交互 sudo 权限；请勿使用 sudo 启动整个测试链" >&2
+  exit 1
+fi
+SERVER_TOKEN=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+UCM_HOST_SERVER_TOKEN="$SERVER_TOKEN" \
+  setsid bash "$REPO/server_test_host.sh" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
+SERVER_START_TIME=$(python3 - "$SERVER_PID" <<'PY'
+from pathlib import Path
+import sys
+
+print((Path("/proc") / sys.argv[1] / "stat").read_text().rsplit(")", 1)[1].split()[19])
+PY
+)
 
 if ! wait_for_server; then
   exit 1
@@ -228,6 +234,8 @@ fi
 echo "==> [2/3] 启动 client_test_host.sh --stop-server (REPLAY_WINDOW_SEC=$REPLAY_WINDOW_SEC)"
 echo "    日志: $CLIENT_LOG"
 REPLAY_WINDOW_SEC="$REPLAY_WINDOW_SEC" \
+  UCM_HOST_SERVER_PID="$SERVER_PID" UCM_HOST_SERVER_START_TIME="$SERVER_START_TIME" \
+  UCM_HOST_SERVER_TOKEN="$SERVER_TOKEN" \
   setsid bash "$REPO/client_test_host.sh" --stop-server >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 

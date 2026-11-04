@@ -34,6 +34,8 @@ class SpdkStatsTest(unittest.TestCase):
     def test_backend_detection(self):
         self.assertEqual(stats.backend(self.config()), "spdk")
         self.assertEqual(stats.backend({"store_pipeline": "Cache|Posix"}), "posix")
+        self.assertEqual(stats.backend({"store_pipeline": "Cache|Empty"}), "empty")
+        self.assertEqual(stats.backend({"store_pipeline": "Empty"}), "empty")
         with self.assertRaises(ValueError):
             stats.backend({"store_pipeline": "Fake"})
 
@@ -45,6 +47,27 @@ class SpdkStatsTest(unittest.TestCase):
             stats.posix_engine(config | {"posix_io_engine": "invalid"})
         with self.assertRaises(ValueError):
             stats.posix_engine(self.config())
+
+    def test_empty_reports_cache_metrics_without_target_or_posix(self):
+        for options, count, sleeps in (([], 1, []),
+                                       (["--cycles", "3", "--interval", "5"], 3, [5, 5]),
+                                       (["--mode", "probe", "--probe-seconds", "2"], 2, [2])):
+            with self.subTest(options=options), \
+                    patch.object(sys, "argv", ["stats", "--config", "fake", *options]), \
+                    patch.object(stats, "load_config", return_value={"store_pipeline": "Cache|Empty"}), \
+                    patch.object(stats, "cache_metrics") as metrics, \
+                    patch.object(stats, "rpc") as rpc, \
+                    patch.object(stats, "sample_ipc") as ipc, \
+                    patch.object(stats, "resolve_target") as resolve, \
+                    patch.object(stats, "posix_engine") as posix, \
+                    patch.object(stats.time, "sleep") as sleep, \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                stats.main()
+                self.assertEqual(metrics.call_count, count)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], sleeps)
+                self.assertIn("Backend I/O, SSD latency, files and syscalls: N/A", out.getvalue())
+                for mock in (rpc, ipc, resolve, posix):
+                    mock.assert_not_called()
 
     def test_local_target_resolved_from_config(self):
         subsystem = {"subtype": "NVMe", "nqn": "nqn.test", "listen_addresses": [
@@ -71,6 +94,64 @@ class SpdkStatsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "not a local target"):
                     stats.resolve_target(self.config(), "127.0.0.1")
             rpc.assert_not_called()
+
+    def test_ipc_socket_is_parsed_from_combined_trid(self):
+        config = {"store_pipeline": "Cache|Spdk",
+                  "spdk_trid": "ipc:/tmp/ucm_spdk_ipc.sock|trtype:PCIe traddr:0000:84:00.0"}
+        self.assertEqual(stats.ipc_socket(config), "/tmp/ucm_spdk_ipc.sock")
+        self.assertIsNone(stats.ipc_socket(self.config()))
+        with self.assertRaisesRegex(ValueError, "missing the target socket"):
+            stats.ipc_socket({"spdk_trid": "ipc:|trtype:PCIe"})
+
+    def test_ipc_target_counters_are_mapped_without_rpc(self):
+        payload = json.dumps({
+            "version": 1, "name": "ipc-target", "tick_rate": 100,
+            "ticks": 300, "bytes_read": 4096, "bytes_written": 8192,
+            "num_read_ops": 2, "num_write_ops": 3, "num_flush_ops": 4,
+            "read_latency_ticks": 20, "write_latency_ticks": 30,
+            "completion_errors": 1, "submit_errors": 2,
+            "connections": 8, "qpairs": 8, "num_sectors": 100,
+            "sector_size": 512,
+        }).encode()
+
+        class FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def connect(self, path):
+                self.path = path
+
+            def sendall(self, data):
+                self.sent = data
+
+            def recv(self, size):
+                data, self._data = self._data, b""
+                return data
+
+        fake = FakeSocket()
+        fake._data = payload
+        with patch.object(stats.socket, "socket", return_value=fake), \
+                patch.object(stats, "rpc") as rpc:
+            sample = stats.sample_ipc("/tmp/ucm_spdk_ipc.sock")
+        rpc.assert_not_called()
+        self.assertEqual(fake.path, "/tmp/ucm_spdk_ipc.sock")
+        self.assertEqual(fake.sent, b"UCM_STATS\n")
+        self.assertEqual(sample["bdev"]["bytes_written"], 8192)
+        self.assertEqual(sample["bdev"]["io_error"], {"completion": 1, "submit": 2})
+        self.assertEqual(sample["connections"], 8)
+        self.assertEqual(sample["flush_ops"], 4)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            stats.report(sample)
+        self.assertIn("avg target logical I/O latency", out.getvalue())
+        self.assertIn("sessions: 8", out.getvalue())
+        self.assertNotIn("avg bdev latency", out.getvalue())
 
     def test_completed_io_delta_and_latency(self):
         out = io.StringIO()

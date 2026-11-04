@@ -111,6 +111,8 @@ public:
     Status Setup(const Config& config);
     void* HostData();
     size_t HostDataSize();
+    int HostFd() const;
+    uint64_t HostFileOffset() const;
     Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
                bool isLoad = false);
     void Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false);

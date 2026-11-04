@@ -1,5 +1,6 @@
 # Shared UCM CPU affinity patch helpers for vllm-ascend.
 import os
+import re
 from pathlib import Path
 
 import psutil
@@ -20,6 +21,57 @@ def _logger():
 
 def _ucm_affinity_enabled() -> bool:
     return os.getenv("VLLM_CPU_AFFINITY") == "1"
+
+
+def _ipc_target_cpus() -> set[int]:
+    value = os.getenv("UCM_IPC_TARGET_CPUS")
+    if value is None:
+        return set()
+    reserved: set[int] = set()
+    for item in value.split(","):
+        match = re.fullmatch(r"([0-9]+)(?:\s*-\s*([0-9]+))?", item.strip())
+        if match is None:
+            raise ValueError(
+                f"Invalid UCM_IPC_TARGET_CPUS={value!r}: expected comma-separated "
+                "CPU IDs or ascending ranges (for example 128-159,192)."
+            )
+        first = int(match[1])
+        last = int(match[2]) if match[2] is not None else first
+        if last < first:
+            raise ValueError(
+                f"Invalid UCM_IPC_TARGET_CPUS={value!r}: descending CPU range."
+            )
+        reserved.update(range(first, last + 1))
+    return reserved
+
+
+def _reserve_ipc_cpus(npu, main, acl, rel):
+    reserved = _ipc_target_cpus()
+    if not reserved:
+        return main, acl, rel
+    assigned = main + acl + rel
+    available = list(dict.fromkeys(cpu for cpu in assigned if cpu not in reserved))
+    _logger().info(
+        "[UCM CPU Reservation] NPU%s: UCM_IPC_TARGET_CPUS=%s; excluded assigned CPUs=%s",
+        npu,
+        sorted(reserved),
+        sorted(set(assigned) & reserved),
+    )
+    if not reserved.intersection(assigned):
+        return main, acl, rel
+    main_count = len(available) - len(acl) - len(rel)
+    if main_count < 1:
+        raise RuntimeError(
+            f"NPU{npu}: insufficient CPUs after UCM_IPC_TARGET_CPUS reservation; "
+            f"need at least one main, {len(acl)} ACL and {len(rel)} release CPUs, "
+            f"but only {len(available)} assigned CPUs remain."
+        )
+    # Use only upstream-assigned cores, never its IRQ-reserved or other pool cores.
+    return (
+        available[:main_count],
+        available[main_count : main_count + len(acl)],
+        available[main_count + len(acl) :],
+    )
 
 
 def _current_npu(self) -> int:
@@ -138,6 +190,7 @@ def assign_cpu_roles(
     acl: list[int],
     rel: list[int],
 ) -> None:
+    main, acl, rel = _reserve_ipc_cpus(npu, main, acl, rel)
     if _ucm_affinity_enabled():
         worker_cores, ucm_cores = _split_contiguous_halves(main)
         if ucm_cores:
@@ -156,8 +209,7 @@ def assign_cpu_roles(
 
 # ---------------------------------------------------------------------------
 # Legacy replacements (vllm-ascend <= 0.25.1). Re-implement the allocation and
-# binding rules inline; kept byte-for-byte identical to the historical shared
-# implementation so the per-version v0191..v0251 installers keep working.
+# binding rules inline for the per-version v0191..v0251 installers.
 # ---------------------------------------------------------------------------
 
 
@@ -168,12 +220,22 @@ def allocate(self) -> None:
     import vllm_ascend.cpu_binding as cpu_binding
 
     min_cpus_per_npu = getattr(cpu_binding, "MIN_CPUS_PER_NPU", 5)
+    reserved = _ipc_target_cpus()
 
     for npu, pool in self.npu_cpu_pool.items():
+        if reserved:
+            _logger().info(
+                "[UCM CPU Reservation] NPU%s: UCM_IPC_TARGET_CPUS=%s; excluded pool CPUs=%s",
+                npu,
+                sorted(reserved),
+                sorted(set(pool) & reserved),
+            )
+            pool = [cpu for cpu in pool if cpu not in reserved]
         if len(pool) < min_cpus_per_npu:
             raise RuntimeError(
                 "The number of CPUs is insufficient. Each NPU requires at "
                 f"least {min_cpus_per_npu} CPUs."
+                + (" After UCM_IPC_TARGET_CPUS reservation." if reserved else "")
             )
 
         assign_cpu_roles(self, npu, pool[2:-2], [pool[-2]], [pool[-1]])
@@ -223,8 +285,8 @@ def bind_threads(self) -> None:
 # Fixed replacements (vllm-ascend >= 0.26.0). Version-independent: each
 # function calls the original upstream ``CpuAlloc`` method captured at install
 # time, then augments it. Allocation rules (Ascend 950 clusters, IRQ
-# reservation, device mapping via ``self.current_npu``) stay entirely in
-# upstream code, so no per-version maintenance is needed from 0.26.0 onward.
+# reservation, device mapping via ``self.current_npu``) stay in upstream code;
+# IPC reservations use only the resulting assigned cores.
 # ---------------------------------------------------------------------------
 
 
@@ -233,22 +295,13 @@ def allocate_fixed(self, orig_allocate=None) -> None:
     if orig_allocate is None:
         allocate(self)
         return
+    _ipc_target_cpus()  # Reject invalid reservations before upstream allocation.
     orig_allocate(self)
 
     self.assign_ucm = {}
     self.assign_ucm_health = {}
-    if _ucm_affinity_enabled():
-        for npu, main in self.assign_main.items():
-            worker_cores, ucm_cores = _split_contiguous_halves(main)
-            if ucm_cores:
-                self.assign_main[npu] = worker_cores
-            ucm_cores, health_cores = _split_health_cores(ucm_cores)
-            self.assign_ucm[npu] = ucm_cores
-            self.assign_ucm_health[npu] = health_cores
-    else:
-        for npu in self.assign_main:
-            self.assign_ucm[npu] = []
-            self.assign_ucm_health[npu] = []
+    for npu, main in self.assign_main.items():
+        assign_cpu_roles(self, npu, main, self.assign_acl[npu], self.assign_rel[npu])
 
 
 def print_plan_fixed(self, orig_print_plan=None) -> None:

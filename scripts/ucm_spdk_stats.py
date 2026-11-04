@@ -1,4 +1,7 @@
-"""Read-only SPDK target statistics for ucm_store_stats.sh; no engine initialization."""
+"""Read-only SPDK statistics for ucm_store_stats.sh; no engine initialization.
+
+Supports IPC counters, NVMe-oF RPCs, and Cache-only metrics for Empty backends.
+"""
 
 import argparse
 import ipaddress
@@ -6,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -31,6 +35,8 @@ def backend(config):
         return "spdk"
     if "posix" in stages:
         return "posix"
+    if "empty" in stages:
+        return "empty"
     raise ValueError("unsupported store_pipeline; select STORE_BACKEND explicitly")
 
 
@@ -92,6 +98,16 @@ def resolve_target(config, host):
     return subsystem["nqn"], selected or names[0]
 
 
+def ipc_socket(config):
+    trid = str(config.get("spdk_trid", "")).strip()
+    if not trid.startswith("ipc:"):
+        return None
+    path = trid[4:].split("|", 1)[0].strip()
+    if not path:
+        raise ValueError("ipc spdk_trid is missing the target socket path")
+    return path
+
+
 def sample(nqn, name):
     result = rpc("bdev_get_iostat", "--names", name)
     bdev = next(b for b in result["bdevs"] if b["name"] == name)
@@ -99,6 +115,50 @@ def sample(nqn, name):
     return {"bdev": bdev, "tick_rate": result["tick_rate"], "ticks": result["ticks"],
             "connections": len(controllers),
             "qpairs": sum(c.get("num_io_qpairs", 0) for c in controllers)}
+
+
+def sample_ipc(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(5)
+        conn.connect(path)
+        conn.sendall(b"UCM_STATS\n")
+        chunks = []
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    raw = b"".join(chunks)
+    if not raw:
+        raise RuntimeError(
+            f"empty IPC target statistics response from {path}; "
+            "restart the target with the current ucm_spdk_ipc_target binary"
+        )
+    data = json.loads(raw.decode("utf-8"))
+    if data.get("version") != 1:
+        raise ValueError("unsupported IPC target statistics version")
+    bdev = {
+        "name": data.get("name", "ipc-target"),
+        "bytes_read": int(data["bytes_read"]),
+        "bytes_written": int(data["bytes_written"]),
+        "num_read_ops": int(data["num_read_ops"]),
+        "num_write_ops": int(data["num_write_ops"]),
+        "read_latency_ticks": int(data["read_latency_ticks"]),
+        "write_latency_ticks": int(data["write_latency_ticks"]),
+        "io_error": {
+            "completion": int(data.get("completion_errors", 0)),
+            "submit": int(data.get("submit_errors", 0)),
+        },
+    }
+    return {
+        "bdev": bdev,
+        "tick_rate": int(data["tick_rate"]),
+        "ticks": int(data["ticks"]),
+        "connections": int(data.get("connections", 0)),
+        "qpairs": int(data.get("qpairs", 0)),
+        "flush_ops": int(data.get("num_flush_ops", 0)),
+        "ipc": True,
+    }
 
 
 def report(current, previous=None):
@@ -122,8 +182,12 @@ def report(current, previous=None):
         latency = (f"{data[f'{op}_latency_ticks'] / current['tick_rate'] * 1e6 / count:.1f} us"
                    if count else "N/A")
         rate = f" | {size / elapsed / 1e9:.3f} GB/s | {count / elapsed:.1f} IOPS" if elapsed else ""
-        print(f"  {op}: {size:,} B ({size / 2**30:.3f} GiB), {count:,} ops{rate} | avg bdev latency {latency}")
-    print(f"  controllers: {current['connections']} | reported I/O qpairs: {current['qpairs']}")
+        layer = "target logical I/O" if current.get("ipc") else "bdev"
+        print(f"  {op}: {size:,} B ({size / 2**30:.3f} GiB), {count:,} ops{rate} | avg {layer} latency {latency}")
+    if current.get("flush_ops") is not None:
+        print(f"  flush: {current['flush_ops']:,} ops (cumulative)")
+    connections = "sessions" if current.get("ipc") else "controllers"
+    print(f"  {connections}: {current['connections']} | reported I/O qpairs: {current['qpairs']}")
     print("  io_error (target cumulative, not Store health): "
           + json.dumps(current["bdev"].get("io_error", "N/A"), sort_keys=True))
 
@@ -175,6 +239,7 @@ def main():
     parser.add_argument("--config-path", action="store_true")
     parser.add_argument("--detect", action="store_true")
     parser.add_argument("--posix-engine", action="store_true")
+    parser.add_argument("--backend", choices=("spdk", "empty"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default="7780")
     parser.add_argument("--mode", choices=("snapshot", "watch", "probe"), default="snapshot")
@@ -197,18 +262,46 @@ def main():
     if args.detect:
         print(backend(config))
         return
-    if backend(config) != "spdk":
-        raise ValueError("configuration is not a Spdk pipeline")
     if args.interval <= 0 or args.probe_seconds <= 0 or args.cycles < 0:
         raise ValueError("interval/probe duration must be positive; cycles must be nonnegative")
-    nqn, name = resolve_target(config, args.host)
-    print(f"SPDK target: {config['spdk_trid']} | bdev: {name} | config: {args.config}")
-    print(f"Configured pool: {config.get('spdk_capacity_gb', 'N/A')} GiB (not measured usage)")
-    print("Read-only RPC; counters are NOT reset. Target-wide completed I/O includes all clients,")
-    print("startup/recovery and index I/O; these are not per-model payload or durability counters.")
-    print("N/A: Posix files/syscalls, Store used capacity/GC/health and Store task latency (not exported).")
-    print("Cache load / external hits may come from host Cache, not SSD. Bdev latency excludes H2D/D2H.")
-    previous = sample(nqn, name)
+    selected_backend = args.backend or backend(config)
+    if selected_backend == "empty":
+        print(f"Empty backend | pipeline: {config.get('store_pipeline', 'N/A')} | config: {args.config}")
+        print("UCM/Cache metrics only. Backend I/O, SSD latency, files and syscalls: N/A.")
+        print("Empty does not retain payloads; loads require resident host Cache hits.")
+        print("Cumulative metrics include prerequisite waits; D2H duration is not pure memcpy time.")
+        cycles = 0
+        while True:
+            print(f"[{time.strftime('%H:%M:%S')}] Empty backend (cumulative UCM/Cache metrics)")
+            cache_metrics(args.host, args.port)
+            sys.stdout.flush()
+            cycles += 1
+            if (args.mode == "probe" and cycles >= 2) or (
+                    args.mode != "probe" and args.cycles and cycles >= args.cycles):
+                return
+            time.sleep(args.probe_seconds if args.mode == "probe" else args.interval)
+    if selected_backend != "spdk":
+        raise ValueError("configuration is not a Spdk or Empty pipeline")
+    ipc = ipc_socket(config)
+    if ipc is not None:
+        print(f"SPDK IPC target: {config['spdk_trid']} | socket: {ipc} | config: {args.config}")
+        print(f"Configured pool: {config.get('spdk_capacity_gb', 'N/A')} GiB (not measured usage)")
+        print("Read-only built-in target counters; no NVMe-oF RPC socket required. Counters are NOT reset.")
+        print("IPC ops count logical requests, not split NVMe/bdev commands; latency excludes IPC queueing.")
+        print("Target-wide completed I/O includes all clients, startup/recovery and index I/O; these")
+        print("are not per-model payload or durability counters.")
+        print("N/A: Posix files/syscalls, Store used capacity/GC/health and Store task latency (not exported).")
+        print("Cache load / external hits may come from host Cache, not SSD. Bdev latency excludes H2D/D2H.")
+        previous = sample_ipc(ipc)
+    else:
+        nqn, name = resolve_target(config, args.host)
+        print(f"SPDK target: {config['spdk_trid']} | bdev: {name} | config: {args.config}")
+        print(f"Configured pool: {config.get('spdk_capacity_gb', 'N/A')} GiB (not measured usage)")
+        print("Read-only RPC; counters are NOT reset. Target-wide completed I/O includes all clients,")
+        print("startup/recovery and index I/O; these are not per-model payload or durability counters.")
+        print("N/A: Posix files/syscalls, Store used capacity/GC/health and Store task latency (not exported).")
+        print("Cache load / external hits may come from host Cache, not SSD. Bdev latency excludes H2D/D2H.")
+        previous = sample(nqn, name)
     report(previous)
     cache_metrics(args.host, args.port)
     sys.stdout.flush()
@@ -216,9 +309,10 @@ def main():
     while args.mode == "probe" or not args.cycles or cycles < args.cycles:
         time.sleep(args.probe_seconds if args.mode == "probe" else args.interval)
         try:
-            current = sample(nqn, name)
+            current = sample_ipc(ipc) if ipc is not None else sample(nqn, name)
         except Exception as error:
-            print(f"  RPC unavailable: {error}; baseline discarded", flush=True)
+            source = "IPC target" if ipc is not None else "RPC"
+            print(f"  {source} unavailable: {error}; baseline discarded", flush=True)
             previous = None
             if args.mode == "probe":
                 raise
@@ -238,5 +332,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(130)
     except Exception as error:
-        print(f"SPDK statistics error: {error}", file=sys.stderr)
+        print(f"Store statistics error: {error}", file=sys.stderr)
         sys.exit(1)

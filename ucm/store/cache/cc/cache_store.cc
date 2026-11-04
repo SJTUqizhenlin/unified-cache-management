@@ -44,9 +44,17 @@ class CacheStore : public StoreV1 {
         StoreV1* backend{nullptr};
         void* addr{nullptr};
         size_t size{0};
+        int fd{-1};
+        uint64_t file_offset{0};
         ~BackendMemoryRegistration()
         {
-            if (backend && addr) { backend->UnregisterHostMemory(addr, size); }
+            if (backend && addr) {
+                if (fd >= 0) {
+                    backend->UnregisterHostMemoryFd(fd, addr, size, file_offset);
+                } else {
+                    backend->UnregisterHostMemory(addr, size);
+                }
+            }
         }
     };
 
@@ -87,7 +95,14 @@ public:
         auto* hostData = bufferMgr_.HostData();
         auto hostSize = bufferMgr_.HostDataSize();
         if (backend_ && hostData && hostSize > 0) {
-            s = backend_->RegisterHostMemory(hostData, hostSize);
+            const auto hostFd = bufferMgr_.HostFd();
+            const auto hostFileOffset = bufferMgr_.HostFileOffset();
+            if (hostFd >= 0) {
+                s = backend_->RegisterHostMemoryFd(hostFd, hostData, hostSize,
+                                                   hostFileOffset);
+            } else {
+                s = backend_->RegisterHostMemory(hostData, hostSize);
+            }
             if (s.Failure()) [[unlikely]] {
                 UC_ERROR("Failed({}) to register Cache SHM ({}, {} bytes) in backend {}.",
                          s, hostData, hostSize, backend_->Readme());
@@ -96,6 +111,8 @@ public:
             backendMemory_.backend = backend_;
             backendMemory_.addr = hostData;
             backendMemory_.size = hostSize;
+            backendMemory_.fd = hostFd;
+            backendMemory_.file_offset = hostFileOffset;
         }
         transEnable_ = config.deviceId >= 0;
         if (transEnable_) {
@@ -182,6 +199,8 @@ private:
         if (param.shardSize > 0) { param.waitingQueueDepth *= (param.blockSize / param.shardSize); }
         config.Get("share_buffer_enable", param.shareBufferEnable);
         config.Get("shm_hugepage_advise", param.shmHugepageAdvise);
+        config.Get("shm_use_hugepage_file", param.shmUseHugepageFile);
+        config.Get("shm_hugepage_dir", param.shmHugepageDir);
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);
         size_t bufferCapacityGb = 0;

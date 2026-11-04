@@ -220,6 +220,12 @@ spdk_store_register_memory(void *addr, uint64_t size)
 {
 	return store_register_memory(addr, size);
 }
+int
+spdk_store_register_memory_fd(int fd, void *addr, uint64_t size, uint64_t file_offset)
+{
+	return store_register_memory_fd(fd, addr, size, file_offset);
+}
+
 
 int
 spdk_store_unregister_memory(void *addr, uint64_t size)

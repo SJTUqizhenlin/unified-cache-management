@@ -10,11 +10,22 @@
  * Also tests same-region deferred reclaim after B-first fini/destroy, with
  * A's partial-overwrite pin held locally and in an exec'd remote process.
  * Only controller/namespace/IO and external host registration are mocked.
+ * IPC tests use real client rings/bridges with anonymous arenas and fake target
+ * completions, including a real reactor's unregister cancellation/drain fence.
  * No device is enumerated, connected, read, written or formatted.
  */
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <signal.h>
+#include <time.h>
+static int test_worker_kill(pid_t pid, int sig);
+static int test_worker_clock_gettime(clockid_t clock, struct timespec *ts);
+#define kill test_worker_kill
+#define clock_gettime test_worker_clock_gettime
 #define ENGINE_LIB 1
 #define spdk_nvme_connect test_connect
 #define spdk_nvme_ctrlr_get_data test_ctrlr_data
@@ -39,6 +50,8 @@
 #define spdk_zmalloc test_zmalloc
 #define spdk_free test_free
 #include "ucm_spdk_store.c"
+#undef kill
+#undef clock_gettime
 #undef spdk_zmalloc
 #undef spdk_free
 void *spdk_zmalloc(size_t size, size_t align, uint64_t *unused, int numa, uint32_t flags);
@@ -75,6 +88,125 @@ static const uint8_t *expected_payload;
 static unsigned payload_ios;
 /* Two fully populated engines, including their separate metadata buffers. */
 static struct { void *ptr; size_t size; } dma_live[2 * (IO_POOL_BUFS + NUM_IDX_BUFS + 1)];
+
+/* Only the testing thread mocks liveness; other engine reactors stay real. */
+static _Thread_local int worker_probe_test, recovery_deadline_test;
+static int worker_probe_errno = -1, worker_probe_replace;
+static unsigned worker_probe_calls;
+static uint64_t worker_test_ns;
+
+static int test_worker_clock_gettime(clockid_t clock, struct timespec *ts)
+{
+	if (!worker_probe_test) { return clock_gettime(clock, ts); }
+	assert(clock == CLOCK_MONOTONIC);
+	ts->tv_sec = worker_test_ns / 1000000000ULL;
+	ts->tv_nsec = worker_test_ns % 1000000000ULL;
+	return 0;
+}
+
+static int test_worker_kill(pid_t pid, int sig)
+{
+	if (!worker_probe_test) { return kill(pid, sig); }
+	assert(sig == 0);
+	worker_probe_calls++;
+	/* Probing must not hold the shared mutex, even for an ESRCH result. */
+	assert(pthread_mutex_trylock(&g_shm->lock) == 0);
+	if (worker_probe_replace) { g_shm->workers[0] = getpid(); }
+	assert(pthread_mutex_unlock(&g_shm->lock) == 0);
+	if (worker_probe_errno < 0) { return kill(pid, sig); }
+	errno = worker_probe_errno;
+	return worker_probe_errno ? -1 : 0;
+}
+
+/* Fork assertions run before DPDK starts threads; no target or hardware IO. */
+static void test_worker_liveness(void)
+{
+	struct spdk_store_engine *e = store_engine_create();
+	assert(e);
+	store_engine_select(e);
+	g_role = ROLE_LOOKUP;
+	g_shm_size = sizeof(struct shm_header);
+	g_shm_base = mmap(NULL, g_shm_size, PROT_READ | PROT_WRITE,
+			  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	assert(g_shm_base != MAP_FAILED);
+	g_shm = (void *)g_shm_base;
+	pthread_mutexattr_t attr;
+	assert(pthread_mutexattr_init(&attr) == 0);
+	assert(pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) == 0);
+	assert(pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0);
+	assert(pthread_mutex_init(&g_shm->lock, &attr) == 0);
+	assert(pthread_mutexattr_destroy(&attr) == 0);
+	pid_t dead = fork();
+	assert(dead >= 0);
+	if (!dead) { _exit(0); }
+	int status;
+	assert(waitpid(dead, &status, 0) == dead && WIFEXITED(status));
+	g_shm->workers[0] = dead;
+	worker_probe_test = 1;
+	worker_test_ns = 10000000000ULL;
+	worker_probe_errno = 0;
+	shm_lock();
+	shm_unlock();
+	assert(worker_probe_calls == 1);
+	worker_probe_errno = -1; /* Now use the real syscall against the reaped PID. */
+	for (unsigned i = 0; i < 1000; i++) { shm_lock(); shm_unlock(); }
+	worker_test_ns += 999999999ULL;
+	shm_lock();
+	shm_unlock();
+	assert(worker_probe_calls == 1 && !g_shm->recovery_required);
+	worker_test_ns++;
+	pid_t child = fork();
+	assert(child >= 0);
+	if (!child) { shm_lock(); _exit(1); }
+	assert(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+	assert(g_shm->recovery_required);
+	/* Recovery flags still fail closed even inside the throttle window. */
+	atomic_store(&e->worker_check_after_ns, UINT64_MAX);
+	child = fork();
+	assert(child >= 0);
+	if (!child) { shm_lock(); _exit(1); }
+	assert(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+	g_shm->recovery_required = 0;
+	atomic_store(&e->worker_check_after_ns, 0);
+	/* A slot removed/replaced during the outside-lock probe is not a death. */
+	worker_probe_replace = 1;
+	shm_lock();
+	shm_unlock();
+	assert(worker_probe_calls == 2 && !g_shm->recovery_required);
+	worker_probe_replace = 0;
+	g_shm->workers[0] = dead;
+	worker_probe_errno = EPERM;
+	worker_test_ns += 1000000000ULL;
+	shm_lock();
+	shm_unlock();
+	assert(worker_probe_calls == 3 && !g_shm->recovery_required);
+	/* Robust-owner failure is immediate, without waiting for maintenance. */
+	child = fork();
+	assert(child >= 0);
+	if (!child) { assert(pthread_mutex_lock(&g_shm->lock) == 0); _exit(0); }
+	assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
+	child = fork();
+	assert(child >= 0);
+	if (!child) { shm_lock(); _exit(1); }
+	assert(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+	assert(g_shm->recovery_required);
+	/* Exclusive recovery retains its ability to clear owner-death state. */
+	child = fork();
+	assert(child >= 0);
+	if (!child) { assert(pthread_mutex_lock(&g_shm->lock) == 0); _exit(0); }
+	assert(waitpid(child, &status, 0) == child && WIFEXITED(status));
+	g_shm_recovery_owner = g_shm_recovering = 1;
+	shm_lock();
+	shm_unlock();
+	assert(!g_shm->recovery_required && worker_probe_calls == 3);
+	g_shm_recovery_owner = g_shm_recovering = 0;
+	memset(g_shm->workers, 0, sizeof(g_shm->workers));
+	worker_probe_test = 0;
+	assert(pthread_mutex_destroy(&g_shm->lock) == 0);
+	shm_close_segment();
+	assert(!atomic_load(&e->worker_check_after_ns));
+	store_engine_destroy(e);
+}
 
 void *test_zmalloc(size_t size, size_t align, uint64_t *unused, int numa, uint32_t flags)
 {
@@ -195,6 +327,13 @@ static int test_io(struct spdk_nvme_qpair *p, void *buf, uint64_t lba,
 		mem = d->sb;
 	} else if (lba >= g_index_base && lba < g_index_base + TEST_SLOTS) {
 		assert(lba + count <= g_index_base + TEST_SLOTS);
+		if (recovery_deadline_test) {
+			assert(pthread_mutex_trylock(&g_shm->lock) == EBUSY);
+			assert(worker_test_ns < atomic_load(&ENGINE->worker_check_after_ns));
+			worker_test_ns += 1000000000ULL;
+			assert(worker_test_ns >= atomic_load(&ENGINE->worker_check_after_ns));
+			recovery_deadline_test = 0;
+		}
 		mem = d->records + (lba - g_index_base) * mock_sector;
 	} else {
 		assert(!metadata_only);
@@ -366,7 +505,26 @@ static void test_engines(void)
 		assert(store_quiesce() == 0);
 		reactor_pause();
 		memset(g_hash, 0, g_shm->hash_size * sizeof(*g_hash));
-		assert(store_recover() == 0 && store_lookup(id));
+		/* Expire maintenance inside the locked batch read, not before entry.
+		 * Both direct and already-recovering callers must restore their state,
+		 * including when the read completion fails. No sleeps are needed. */
+		unsigned probes = worker_probe_calls;
+		worker_probe_test = 1;
+		for (int recovering = 0; recovering <= 1; recovering++) {
+			for (int failure = 1; failure >= 0; failure--) {
+				g_shm_recovering = recovering;
+				atomic_store(&ENGINE->worker_check_after_ns, worker_test_ns + 1);
+				recovery_deadline_test = 1;
+				fail_completion = failure;
+				assert(store_recover() == (failure ? -EIO : 0));
+				assert(!recovery_deadline_test && g_shm_recovering == recovering);
+				assert(worker_probe_calls == probes);
+				assert(atomic_load(&ENGINE->worker_check_after_ns) <= worker_test_ns);
+			}
+		}
+		g_shm_recovering = 0;
+		worker_probe_test = 0;
+		assert(store_lookup(id));
 		assert(store_lookup(only_wa) == (int)r);
 		/* Recovery deliberately clears registrations under exclusive ownership. */
 		assert(shm_register_worker() == 0);
@@ -861,6 +1019,384 @@ static void test_load_admission_and_affinity(void)
 	store_engine_destroy(e);
 }
 
+static void test_ipc_identity_and_overlap(void)
+{
+	struct spdk_store_engine *a = store_engine_create(), *b = store_engine_create();
+	assert(a && b);
+	assert(default_engine.meta_fd == -1 && default_engine.cache_fd == -1);
+	assert(a->meta_fd == -1 && a->cache_fd == -1);
+	assert(b->meta_fd == -1 && b->cache_fd == -1);
+	char socket[128], target[256];
+	memset(socket, 's', sizeof(socket) - 1);
+	socket[0] = '/';
+	socket[sizeof(socket) - 1] = '\0';
+	snprintf(target, sizeof(target), "ipc:%s|ignored-target-a", socket);
+	store_engine_select(a);
+	assert(store_parse_region(target, 4) == 0);
+	assert(strcmp(g_ipc_socket, socket) == 0);
+	store_engine_select(b);
+	snprintf(target, sizeof(target), "ipc:%s|ignored-target-b", socket);
+	assert(store_parse_region(target, 4) == 0);
+	assert(strcmp(a->shm_name, b->shm_name) == 0);
+	assert(strcmp(a->lease_name, b->lease_name) == 0);
+	assert(strcmp(a->maintenance_name, b->maintenance_name) == 0);
+	g_layers = 5;
+	g_shard_kb = 6344;
+	build_shm_names();
+	assert(strcmp(a->shm_name, b->shm_name) == 0);
+	assert(store_parse_region(target, 5) == 0);
+	assert(strcmp(a->shm_name, b->shm_name) != 0);
+	assert(strcmp(a->lease_name, b->lease_name) != 0);
+	assert(strcmp(a->maintenance_name, b->maintenance_name) != 0);
+	/* Even the last socket character participates; never hash a truncated path. */
+	socket[sizeof(socket) - 2] = 't';
+	snprintf(target, sizeof(target), "ipc:%s", socket);
+	assert(store_parse_region(target, 4) == 0);
+	assert(strcmp(a->shm_name, b->shm_name) != 0);
+	assert(strcmp(a->lease_name, b->lease_name) != 0);
+	assert(strcmp(a->maintenance_name, b->maintenance_name) != 0);
+	socket[sizeof(socket) - 2] = 's';
+	snprintf(target, sizeof(target), "ipc:%sX", socket);
+	assert(store_parse_region(target, 4) == -ENAMETOOLONG);
+	strcat(target, "|ignored");
+	assert(store_parse_region(target, 4) == -ENAMETOOLONG);
+	assert(store_parse_region("ipc:", 0) == -EINVAL);
+	assert(store_parse_region("ipc:|ignored", 0) == -EINVAL);
+	assert(store_parse_region(transport, 4) == 0);
+	assert(!g_ipc_mode && !g_ipc_socket[0]);
+	assert(store_parse_region("ipc:/tmp/context-test.sock|ignored", 0) == 0);
+	store_engine_select(a);
+	assert(store_parse_region("ipc:/tmp/context-test.sock", 0) == 0);
+	/* Synthetic geometry, but the real engine list and original interval rules.
+	 * IPC and device-less non-IPC engines can both have NULL ctrlr/ns. */
+	a->initialized = 1;
+	a->data_base = b->data_base = 100;
+	a->pool_base = b->pool_base = 120;
+	a->nslots = b->nslots = TEST_SLOTS;
+	a->slot_sectors = b->slot_sectors = 16;
+	a->shard_sectors = b->shard_sectors = 8;
+	b->index_slots = TEST_SLOTS;
+	b->num_sectors = 1000;
+	store_engine_select(b);
+	assert(!a->ctrlr && !b->ctrlr && !a->ns && !b->ns);
+	assert(store_region_available(TEST_SLOTS) == 0); /* same-region join */
+	g_format = 1;
+	assert(store_region_available(TEST_SLOTS) == -EBUSY);
+	g_format = 0;
+	g_shard_sectors++;
+	assert(store_region_available(TEST_SLOTS) == -EBUSY);
+	g_shard_sectors--;
+	assert(store_region_available(TEST_SLOTS - 1) == -EBUSY);
+	g_data_base = 110;
+	assert(store_region_available(TEST_SLOTS) == -EBUSY);
+	g_data_base = 50;
+	g_pool_base = 101; /* metadata alone overlaps the other region */
+	assert(store_region_available(1) == -EBUSY);
+	g_pool_base = 84; /* end exactly equals the other region's start */
+	assert(store_region_available(1) == 0);
+	g_data_base = 248; /* start exactly equals the other region's end */
+	g_pool_base = 268;
+	assert(store_region_available(TEST_SLOTS) == 0);
+	g_data_base = 100;
+	g_pool_base = 120;
+	g_format = 1;
+	a->initialized = 0;
+	assert(store_region_available(TEST_SLOTS) == 0);
+	a->initialized = 1;
+	strcat(g_ipc_socket, ".other");
+	assert(store_region_available(TEST_SLOTS) == 0);
+	assert(store_parse_region("ipc:/tmp/context-test.sock", 0) == 0);
+	a->ipc_mode = 0;
+	assert(store_region_available(TEST_SLOTS) == 0);
+	assert(store_parse_region(transport, 0) == 0);
+	a->ipc_mode = 1;
+	assert(store_region_available(TEST_SLOTS) == 0);
+	assert(store_parse_region("ipc:/tmp/context-test.sock", 0) == 0);
+	assert(store_region_available(0) == -EINVAL);
+	assert(store_region_available(TEST_SLOTS + 1) == -EINVAL);
+	g_num_sectors = 247;
+	assert(store_region_available(TEST_SLOTS) == -EINVAL);
+	store_engine_destroy(b);
+	store_engine_destroy(a);
+}
+
+struct ipc_bridge_result { unsigned calls; int error; };
+
+static void ipc_test_callback(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct ipc_bridge_result *result = arg;
+	assert(result->calls++ == 0);
+	assert(spdk_nvme_cpl_is_error(cpl) == result->error);
+	if (result->error) {
+		assert(cpl->status.sct == SPDK_NVME_SCT_GENERIC);
+		assert(cpl->status.sc == SPDK_NVME_SC_INTERNAL_DEVICE_ERROR);
+	}
+}
+
+static struct ucm_ipc_submit_entry ipc_test_take(struct ucm_ipc_control *ctl)
+{
+	uint32_t tail = atomic_load(&ctl->submit_tail);
+	while (atomic_load_explicit(&ctl->submit_head, memory_order_acquire) == tail) {
+		sched_yield();
+	}
+	struct ucm_ipc_submit_entry entry = ctl->submit[tail & UCM_IPC_RING_MASK];
+	atomic_store_explicit(&ctl->submit_tail, tail + 1, memory_order_release);
+	return entry;
+}
+
+static void ipc_test_complete(struct ucm_ipc_control *ctl, uint64_t id, int status)
+{
+	uint32_t head = atomic_load(&ctl->completion_head);
+	assert(head - atomic_load(&ctl->completion_tail) < UCM_IPC_RING_SIZE - 1);
+	ctl->completion[head & UCM_IPC_RING_MASK] =
+		(struct ucm_ipc_completion_entry){.req_id = id, .status = status};
+	atomic_store_explicit(&ctl->completion_head, head + 1, memory_order_release);
+}
+
+struct ipc_unregister_job {
+	struct spdk_store_engine *engine;
+	_Atomic int done;
+	int rc;
+};
+
+static void *ipc_test_unregister(void *arg)
+{
+	struct ipc_unregister_job *job = arg;
+	store_engine_select(job->engine);
+	job->rc = store_unregister_memory(g_cache_base, g_cache_size);
+	atomic_store(&job->done, 1);
+	return NULL;
+}
+
+static void test_ipc_request_lifecycle(void)
+{
+	struct spdk_store_engine *e = store_engine_create();
+	assert(e);
+	store_engine_select(e);
+	assert(store_parse_region("ipc:/tmp/context-test.sock", 0) == 0);
+	g_sector_size = TEST_SECTOR;
+	g_shard_sectors = TEST_SHARD_KB * 1024 / TEST_SECTOR;
+	g_slot_sectors = 2 * g_shard_sectors;
+	g_nshards = 2;
+	g_nslots = TEST_SLOTS;
+	g_pool_base = 100;
+	g_meta_size = (RECOV_BATCH_MAX + NUM_IDX_BUFS) * TEST_SECTOR;
+	g_meta_base = mmap(NULL, g_meta_size, PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	assert(g_meta_base != MAP_FAILED && store_io_pool_init() == 0);
+	g_cache_size = 3 * TEST_SHARD_KB * 1024;
+	uint8_t *cache = mmap(NULL, g_cache_size, PROT_READ | PROT_WRITE,
+			      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	assert(cache != MAP_FAILED);
+	g_cache_base = cache;
+	g_reg_cache[0] = (struct reg_range){.start = (uintptr_t)cache,
+		.end = (uintptr_t)cache + g_cache_size, .refs = 1};
+	g_reg_count = 1;
+	g_reg_total_bytes = g_cache_size;
+	g_direct_dma = 1;
+	g_ipc.control_fd = -1;
+	g_ipc.control_size = sizeof(struct ucm_ipc_control);
+	g_ipc.ctl = mmap(NULL, g_ipc.control_size, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	assert(g_ipc.ctl != MAP_FAILED);
+	assert(pthread_mutex_init(&g_ipc.cb_mu, NULL) == 0);
+	g_ipc.cb_slots = calloc(UCM_IPC_RING_SIZE, sizeof(*g_ipc.cb_slots));
+	assert(g_ipc.cb_slots != NULL);
+	for (uint32_t i = 0; i < UCM_IPC_RING_SIZE; i++) {
+		g_ipc.cb_slots[i].next_free = i + 1;
+	}
+	g_ipc.cb_free_head = 0;
+	g_ipc.cb_free_count = UCM_IPC_RING_SIZE;
+	g_ipc.next_req_id = 1;
+	struct ucm_ipc_control *ctl = g_ipc.ctl;
+	ucm_ipc_control_init(ctl, IO_POOL_BUFS, g_meta_size);
+	g_ipc_ready = 1;
+	/* Real engine bridge and client callbacks, with no reactor yet. */
+	for (int error = 0; error <= 1; error++) {
+		struct ipc_bridge_result result = {.error = error};
+		void *buf = error ? cache + TEST_SHARD_KB * 1024 : g_idx_bufs[3];
+		assert(store_submit_rw(17, 1, buf, !error, ipc_test_callback, &result) == 0);
+		struct ucm_ipc_submit_entry req = ipc_test_take(ctl);
+		assert(req.region_id == (uint32_t)error && req.offset_bytes == 17 * TEST_SECTOR);
+		assert(req.data_offset == (error ? TEST_SHARD_KB * 1024 :
+			(RECOV_BATCH_MAX + 3) * TEST_SECTOR));
+		assert(req.nbytes == TEST_SECTOR && req.opcode ==
+			(error ? UCM_IPC_OP_READ : UCM_IPC_OP_WRITE));
+		assert(!result.calls && g_ipc.cb_free_count == UCM_IPC_RING_SIZE - 1);
+		assert(ENGINE->ipc_bridge_free_top == IPC_BRIDGE_COUNT - 1);
+		ipc_test_complete(ctl, req.req_id, error ? -EIO : 0);
+		store_poll();
+		assert(result.calls == 1 && g_ipc.cb_free_count == UCM_IPC_RING_SIZE);
+		assert(ENGINE->ipc_bridge_free_top == IPC_BRIDGE_COUNT);
+		store_poll();
+		assert(result.calls == 1);
+	}
+	/* Exhaust the bridge pool, complete in reverse order, and reuse every slot. */
+	struct ipc_bridge_result batch[IPC_BRIDGE_COUNT];
+	struct ucm_ipc_submit_entry requests[IPC_BRIDGE_COUNT];
+	for (unsigned repeat = 0; repeat < 2; repeat++) {
+		memset(batch, 0, sizeof(batch));
+		for (unsigned i = 0; i < IPC_BRIDGE_COUNT; i++) {
+			assert(store_submit_rw(17, 1, cache, 0, ipc_test_callback, &batch[i]) == 0);
+			requests[i] = ipc_test_take(ctl);
+		}
+		uint32_t head = atomic_load(&ctl->submit_head);
+		assert(store_submit_rw(17, 1, cache, 0, ipc_test_callback, &batch) == -EBUSY);
+		assert(atomic_load(&ctl->submit_head) == head);
+		for (unsigned i = IPC_BRIDGE_COUNT; i > 0; i--) {
+			ipc_test_complete(ctl, requests[i - 1].req_id, 0);
+		}
+		store_poll();
+		for (unsigned i = 0; i < IPC_BRIDGE_COUNT; i++) { assert(batch[i].calls == 1); }
+		assert(ENGINE->ipc_bridge_free_top == IPC_BRIDGE_COUNT);
+		assert(g_ipc.cb_free_count == UCM_IPC_RING_SIZE);
+	}
+	/* A client-side rejection must return the already allocated bridge. */
+	g_ipc.cb_free_count = 0;
+	assert(store_submit_rw(17, 1, cache, 0, ipc_test_callback, &batch) == -EBUSY);
+	assert(ENGINE->ipc_bridge_free_top == IPC_BRIDGE_COUNT);
+	g_ipc.cb_free_count = UCM_IPC_RING_SIZE;
+	assert(store_submit_rw(0, 0, cache, 0, NULL, NULL) == -EINVAL);
+	assert(store_submit_rw(0, 1, cache + g_cache_size - TEST_SECTOR + 1,
+			       0, NULL, NULL) == -EFAULT);
+	/* Anonymous shared index supplies the real load pin and dump free list. */
+	g_shm_size = sizeof(struct shm_header) + hash_size_for(TEST_SLOTS) * sizeof(struct hash_entry) +
+		TEST_SLOTS * (sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint16_t) + sizeof(uint8_t));
+	g_shm_base = mmap(NULL, g_shm_size, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	assert(g_shm_base != MAP_FAILED);
+	g_shm = (void *)g_shm_base;
+	g_shm->nslots = TEST_SLOTS;
+	g_shm->hash_size = hash_size_for(TEST_SLOTS);
+	assert(pthread_mutex_init(&g_shm->lock, NULL) == 0);
+	uint8_t load_id[16] = {111}, dump_id[16] = {112};
+	hash_insert(load_id, 0, 1);
+	g_live_count = 1;
+	for (unsigned i = 1; i < TEST_SLOTS; i++) { g_freelist[g_free_top++] = i; }
+	g_last_progress = spdk_get_ticks();
+	assert(reactor_start() == 0);
+	struct io_result load = {0}, dump = {0};
+	assert(store_load_submit(load_id, 0, 1, cache, TEST_SHARD_KB * 1024,
+				 io_callback, &load) == 0);
+	assert(store_dump_submit(dump_id, 0, 1, cache + TEST_SHARD_KB * 1024,
+				 io_callback, &dump) == 0);
+	struct ucm_ipc_submit_entry pending[2] = {ipc_test_take(ctl), ipc_test_take(ctl)};
+	assert(pending[0].req_id != pending[1].req_id);
+	assert(pending[0].opcode != pending[1].opcode);
+	for (unsigned i = 0; i < 2; i++) {
+		assert(pending[i].region_id == 1 && pending[i].nbytes == TEST_SHARD_KB * 1024);
+		assert(pending[i].opcode == UCM_IPC_OP_READ || pending[i].opcode == UCM_IPC_OP_WRITE);
+		assert(pending[i].offset_bytes == (pending[i].opcode == UCM_IPC_OP_READ ?
+			g_pool_base : g_pool_base + (TEST_SLOTS - 1) * g_slot_sectors) * TEST_SECTOR);
+		assert(pending[i].data_offset == (pending[i].opcode == UCM_IPC_OP_READ ?
+			0 : TEST_SHARD_KB * 1024));
+	}
+	struct ipc_unregister_job job = {.engine = e};
+	pthread_t thread;
+	assert(pthread_create(&thread, NULL, ipc_test_unregister, &job) == 0);
+	for (;;) {
+		reactor_pause();
+		int fenced = g_barriers_n != 0;
+		assert(!atomic_load(&job.done));
+		assert(g_cache_base == cache && g_reg_count == 1 && !load.calls && !dump.calls);
+		reactor_resume();
+		if (fenced) { break; }
+		sched_yield();
+	}
+	/* Fake target DMA/completions release the unregister fence, not a timeout. */
+	memset(cache, 0xa5, TEST_SHARD_KB * 1024);
+	for (unsigned i = 0; i < 2; i++) { ipc_test_complete(ctl, pending[i].req_id, 0); }
+	assert(pthread_join(thread, NULL) == 0 && job.rc == 0 && atomic_load(&job.done));
+	assert(load.calls == 1 && load.status == 0 && cache[0] == 0xa5);
+	assert(dump.calls == 1 && dump.status == -EIO);
+	assert(!g_cache_base && !g_cache_size && !g_reg_count && !g_reg_total_bytes && !g_direct_dma);
+	assert(g_ipc_ready); /* No remote unregister protocol: session is still live. */
+	reactor_pause();
+	assert(store_io_drained() && g_ipc.cb_free_count == UCM_IPC_RING_SIZE &&
+	       ENGINE->ipc_bridge_free_top == IPC_BRIDGE_COUNT &&
+	       g_free_top + g_live_count == TEST_SLOTS);
+	assert(!g_pins[0]);
+	reactor_resume();
+	atomic_store(&ctl->closed, 1);
+	store_engine_fini();
+	assert(!g_ipc_ready && !g_ipc.ctl && !g_reactor_started && !g_meta_base);
+	assert(munmap(cache, 3 * TEST_SHARD_KB * 1024) == 0);
+	store_engine_destroy(e);
+}
+
+static void test_ipc_pool_cleanup(void)
+{
+	struct spdk_store_engine *e = store_engine_create();
+	assert(e);
+	store_engine_select(e);
+	assert(store_parse_region("ipc:/tmp/context-test.sock", 0) == 0);
+	/* Cleanup before setup must not close any unrelated descriptor. */
+	int guard = dup(STDERR_FILENO);
+	assert(guard >= 0);
+	store_engine_fini();
+	assert(fcntl(guard, F_GETFD) >= 0);
+	size_t attempts = dma_attempts;
+	for (unsigned sector = TEST_SECTOR; sector <= TEST_MAX_SECTOR; sector *= 8) {
+	 for (unsigned repeat = 0; repeat < 3; repeat++) {
+		g_sector_size = sector;
+		g_shard_sectors = TEST_SHARD_KB * 1024 / sector;
+		g_meta_size = (RECOV_BATCH_MAX + NUM_IDX_BUFS) * sector;
+		g_meta_base = mmap(NULL, g_meta_size, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		assert(g_meta_base != MAP_FAILED);
+		g_meta_fd = dup(guard);
+		assert(g_meta_fd >= 0);
+		assert(store_io_pool_init() == 0);
+		assert(g_meta_buf == g_meta_base && !g_qpair && !g_io_bufs);
+		assert(g_recov_batch == RECOV_BATCH_MAX && g_io_pool_count == IO_POOL_BUFS);
+		assert(!g_bounce_pool_count && !g_bounce_free_top);
+		assert(g_io_free_top == IO_POOL_BUFS && g_idx_free_top == NUM_IDX_BUFS);
+		uint8_t tokens[IO_POOL_BUFS] = {0}, indices[NUM_IDX_BUFS] = {0};
+		for (unsigned i = 0; i < IO_POOL_BUFS; i++) {
+			int token = io_buf_pop();
+			assert(token >= 0 && token < IO_POOL_BUFS && !tokens[token]++);
+		}
+		assert(io_buf_pop() == -1);
+		for (unsigned i = 0; i < NUM_IDX_BUFS; i++) {
+			int index = idx_buf_pop();
+			assert(index >= 0 && index < NUM_IDX_BUFS && !indices[index]++);
+			assert(g_idx_bufs[index] == g_meta_base + (RECOV_BATCH_MAX + index) * sector);
+			uint32_t region;
+			uint64_t offset;
+			assert(store_ipc_buf_region(g_idx_bufs[index], sector, &region, &offset) == 0);
+			assert(region == 0 && offset == (RECOV_BATCH_MAX + index) * sector);
+			memset(g_idx_bufs[index], 0x5a, sector);
+		}
+		assert(idx_buf_pop() == -1);
+		for (unsigned i = 0; i < IO_POOL_BUFS; i++) { io_buf_push(i); }
+		for (unsigned i = 0; i < NUM_IDX_BUFS; i++) { idx_buf_push(i); }
+		assert(store_io_drained());
+		e->initialized = 1;
+		g_healthy = 0;
+		g_stalled = e->had_inflight = 1;
+		g_err_count = 7;
+		g_pinv_n = g_pending_n = g_barriers_n = 1;
+		g_region_reset = 1;
+		g_dctx[0].active = g_lctx[0].active = g_rops[0].active = 1;
+		g_sios[0].dc = &g_dctx[0];
+		int meta_fd = g_meta_fd;
+		store_engine_fini();
+		assert(fcntl(meta_fd, F_GETFD) == -1 && errno == EBADF);
+		assert(fcntl(guard, F_GETFD) >= 0);
+		assert(!e->initialized && g_healthy && !g_stalled && !e->had_inflight);
+		assert(!g_err_count && !g_pinv_n && !g_pending_n && !g_barriers_n && !g_region_reset);
+		assert(!g_dctx[0].active && !g_lctx[0].active && !g_rops[0].active && !g_sios[0].dc);
+		assert(!g_idx_bufs && !g_meta_buf && !g_meta_base && !g_meta_size);
+		assert(g_meta_fd == -1 && g_cache_fd == -1 && !g_ipc_ready);
+		assert(!g_io_pool_count && !g_io_free_top && !g_idx_free_top && !g_recov_batch);
+		store_engine_fini();
+	 }
+	}
+	assert(dma_attempts == attempts && !dma_bytes && !dma_allocations);
+	store_engine_destroy(e);
+	close(guard);
+}
+
 int main(int argc, char **argv)
 {
 	struct rlimit no_core = {0, 0};
@@ -874,7 +1410,12 @@ int main(int argc, char **argv)
 	snprintf(transport, sizeof(transport),
 		 "trtype:RDMA adrfam:IPv4 traddr:127.0.0.1 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:context-test-%s", identity);
 	snprintf(session, sizeof(session), "context-test-%s", identity);
-	if (!worker) { test_region_leases(); }
+	if (!worker) {
+		test_worker_liveness();
+		test_ipc_identity_and_overlap();
+		test_ipc_pool_cleanup();
+		test_region_leases();
+	}
 	snprintf(session, sizeof(session), "format-test-%s", identity);
 	snprintf(disk_name, sizeof(disk_name), "/ucm_engine_mock_disk_%s", identity);
 	int fd = shm_open(disk_name, O_RDWR | (worker ? 0 : O_CREAT | O_EXCL), 0600);
@@ -922,11 +1463,12 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	test_engines();
+	test_ipc_request_lifecycle();
 	test_default_context();
 	test_retirement();
 	test_payload_io();
 	test_bounded_pools();
 	test_load_admission_and_affinity();
-	puts("PASS: 512/4096-sector direct/bounce IO, 256 independent FA+WA tokens, bounded bounce pools, guarded metadata, allocation/IO failure cleanup, region/session leases, real rings/reactors/GC, SHM recovery and local/remote deferred reclaim");
+	puts("PASS: IPC request/completion bridge and unregister drain fence, socket/offset identity, overlap guards and repeated pool cleanup; 512/4096-sector direct/bounce IO, 256 independent FA+WA tokens, bounded bounce pools, guarded metadata, allocation/IO failure cleanup, region/session leases, real rings/reactors/GC, SHM recovery and local/remote deferred reclaim");
 	return 0;
 }

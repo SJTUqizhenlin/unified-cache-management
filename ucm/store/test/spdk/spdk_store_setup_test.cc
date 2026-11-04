@@ -35,7 +35,15 @@ struct EngineState {
     int dumpCalls = 0;
     int healthCalls = 0;
     int registerCalls = 0;
+    int registerFdCalls = 0;
+    int registerFdResult = 0;
+    int registeredFd = -1;
+    void* registeredAddr = nullptr;
+    uint64_t registeredSize = 0;
+    uint64_t registeredOffset = 0;
     int unregisterCalls = 0;
+    void* unregisteredAddr = nullptr;
+    uint64_t unregisteredSize = 0;
     uint32_t slots = 0;
     uint32_t firstShard = 0;
     uint32_t loadLength = 0;
@@ -289,6 +297,79 @@ TEST_F(SpdkStoreSetupTest, GcConfigDelegatedAndStoppedBeforeUnregister)
     store.UnregisterHostMemory(reinterpret_cast<void*>(4096), 4096);
     EXPECT_EQ(engine.lifecycle[2], "gc_stop");
     EXPECT_EQ(engine.lifecycle[3], "unregister");
+}
+
+TEST_F(SpdkStoreSetupTest, HostMemoryFdForwardsArgumentsAndUnregistersOnce)
+{
+    auto config = Config();
+    config.SetNumber("device_id", 0);
+    config.SetNumber("shard_size", 4096);
+    config.SetNumber("block_size", 32768);
+    std::array<uint8_t, 8192> buffer{};
+    constexpr int fd = 23;
+    constexpr uint64_t offset = (uint64_t{1} << 32) + 8192;
+    {
+        UC::SpdkStore::SpdkStore store;
+        ASSERT_TRUE(store.Setup(config).Success());
+        UC::StoreV1& base = store;
+        ASSERT_TRUE(base.RegisterHostMemoryFd(fd, buffer.data(), buffer.size(), offset).Success());
+        const auto& state = contexts.back()->state;
+        EXPECT_EQ(state.registerFdCalls, 1);
+        EXPECT_EQ(state.registerCalls, 0);
+        EXPECT_EQ(state.registeredFd, fd);
+        EXPECT_EQ(state.registeredAddr, buffer.data());
+        EXPECT_EQ(state.registeredSize, buffer.size());
+        EXPECT_EQ(state.registeredOffset, offset);
+        EXPECT_EQ(selected, nullptr);
+
+        base.UnregisterHostMemoryFd(fd, buffer.data(), buffer.size(), offset);
+        EXPECT_EQ(state.unregisterCalls, 1);
+        EXPECT_EQ(state.unregisteredAddr, buffer.data());
+        EXPECT_EQ(state.unregisteredSize, buffer.size());
+        ASSERT_GE(state.lifecycle.size(), size_t{4});
+        EXPECT_EQ(state.lifecycle[2], "gc_stop");
+        EXPECT_EQ(state.lifecycle[3], "unregister");
+        EXPECT_EQ(selected, nullptr);
+    }
+    EXPECT_EQ(engine.unregisterCalls, 1);
+}
+
+TEST_F(SpdkStoreSetupTest, HostMemoryFdReportsEngineError)
+{
+    engine.registerFdResult = -EACCES;
+    auto config = Config();
+    config.SetNumber("device_id", 0);
+    config.SetNumber("shard_size", 4096);
+    config.SetNumber("block_size", 32768);
+    std::array<uint8_t, 4096> buffer{};
+    {
+        UC::SpdkStore::SpdkStore store;
+        ASSERT_TRUE(store.Setup(config).Success());
+        UC::StoreV1& base = store;
+        const auto status = base.RegisterHostMemoryFd(23, buffer.data(), buffer.size(), 4096);
+        EXPECT_EQ(status.ToString(),
+                  UC::Status::Error(fmt::format("spdk_mem_register_fd failed: {}", -EACCES))
+                      .ToString());
+        EXPECT_EQ(engine.registerFdCalls, 1);
+        EXPECT_EQ(engine.registerCalls, 0);
+        EXPECT_EQ(selected, nullptr);
+    }
+    EXPECT_EQ(engine.unregisterCalls, 0);
+}
+
+TEST_F(SpdkStoreSetupTest, LookupOnlyHostMemoryFdDoesNotCallEngine)
+{
+    UC::SpdkStore::SpdkStore store;
+    ASSERT_TRUE(store.Setup(Config()).Success());
+    UC::StoreV1& base = store;
+    std::array<uint8_t, 4096> buffer{};
+    EXPECT_TRUE(base.RegisterHostMemoryFd(23, buffer.data(), buffer.size(), 4096).Success());
+    base.UnregisterHostMemoryFd(23, buffer.data(), buffer.size(), 4096);
+    EXPECT_EQ(engine.registerFdCalls, 0);
+    EXPECT_EQ(engine.registerCalls, 0);
+    EXPECT_EQ(engine.unregisterCalls, 0);
+    EXPECT_EQ(engine.gcStopCalls, 0);
+    EXPECT_EQ(selected, nullptr);
 }
 
 TEST_F(SpdkStoreSetupTest, GcCanBeDisabled)
@@ -571,6 +652,7 @@ spdk_store_engine* spdk_store_engine_create()
     context->state.initResult = engine.initResult;
     context->state.reactorResult = engine.reactorResult;
     context->state.gcResult = engine.gcResult;
+    context->state.registerFdResult = engine.registerFdResult;
     ++engine.createCalls;
     contexts.push_back(std::move(context));
     return contexts.back().get();
@@ -673,10 +755,23 @@ int spdk_store_register_memory(void*, uint64_t)
     Record([](EngineState& state) { ++state.registerCalls; });
     return 0;
 }
-int spdk_store_unregister_memory(void*, uint64_t)
+int spdk_store_register_memory_fd(int fd, void* addr, uint64_t size, uint64_t file_offset)
 {
-    Record([](EngineState& state) {
+    Record([&](EngineState& state) {
+        ++state.registerFdCalls;
+        state.registeredFd = fd;
+        state.registeredAddr = addr;
+        state.registeredSize = size;
+        state.registeredOffset = file_offset;
+    });
+    return Current().registerFdResult;
+}
+int spdk_store_unregister_memory(void* addr, uint64_t size)
+{
+    Record([&](EngineState& state) {
         ++state.unregisterCalls;
+        state.unregisteredAddr = addr;
+        state.unregisteredSize = size;
         state.lifecycle.push_back("unregister");
     });
     return 0;

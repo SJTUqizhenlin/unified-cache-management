@@ -20,6 +20,9 @@ ucm_connectors:
       cache_buffer_capacity_gb: 100
       share_buffer_enable: true
       shm_hugepage_advise: true
+      # For local PCIe/IPC zero-copy, use explicit 2 MiB hugetlbfs pages:
+      # shm_use_hugepage_file: true
+      # shm_hugepage_dir: "/dev/hugepages"
       shm_partition_enable: false
 
 use_layerwise: false

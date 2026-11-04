@@ -174,6 +174,48 @@ INFO: Requested 16384 hugepages but 16384 already allocated
 ```
 > 第一行：系统盘被保护跳过；第二行：目标盘从内核 `nvme` 解绑、绑到 `vfio-pci`；第三行：大页保持 32GB。
 
+IPC `Cache|Spdk` 使用显式大页时，32 GiB 可能不足。当前 V4 FAWA 配置
+`cache_buffer_capacity_gb: 40` 是 FA/WA 共享总预算，另加 target 的 8 GiB
+和 2 GiB header/metadata 余量，共需 50 GiB（25,600 个 2 MiB 页）。
+`server_test_host.sh` 会在停止旧 IPC target 后、启动新 target 前检查并按需扩容：
+
+```sh
+python scripts/ensure_spdk_hugepages.py \
+  --config /home/qizhenlin/ucm-cache/ucm_config_test.yaml \
+  --target-mem-mb 8192 --devices 0,1,2,3,4,5,6,7 \
+  --setup-script /home/qizhenlin/devSPDK/spdk/scripts/setup.sh \
+  --cache-multiplier 1
+```
+
+检查使用 `free_hugepages - resv_hugepages`，只通过官方 `setup.sh` 增加不足的页数，
+不缩减、不清空、不持久化大页，也不改绑任何 PCI 设备。需要 `sudo -n` 权限。
+脚本识别 DeepSeek V2/V3/V4 为共享 Cache，其他模型保守地按设备数计算副本；
+可用 `IPC_CACHE_MULTIPLIER` 覆盖，额外余量可用 `IPC_HUGEPAGE_RESERVE_MB` 覆盖。
+全局页数检查不保证 NUMA 本地性或 cgroup 配额。
+
+`shm_hugepage_dir` 必须位于可写的 2 MiB hugetlbfs。重启后目录权限也可能恢复，
+如需授权当前用户组，由管理员执行（启动预检不会自动修改目录权限）：
+
+```sh
+sudo chgrp "$(id -gn)" /dev/hugepages
+sudo chmod g+rwx /dev/hugepages
+```
+
+VFIO 的重启后恢复仍按上述步骤手动执行。建议限定 `PCI_ALLOWED=0000:84:00.0`
+和 `DEV_TYPE=NVME`；只恢复绑定时设置 `SKIP_HUGE=yes`，避免默认大页预算干扰。
+
+IPC target 默认使用 32 个 reactor，按 NUMA node 交错分配；本机 8 个 node
+各预留 4 核：4--7、36--39、68--71、100--103、132--135、164--167、
+196--199、228--231，不再占满某个 node。规划避开每个 node 的前 4 核和末 2 核。
+`server_test_host.sh` 导出 `UCM_IPC_TARGET_CPUS`，
+由 UCM 的 vllm-ascend CPU binding patch 从 worker、ACL、release 的分配中排除。
+直接使用 `ipc_loop.sh` 启动 target 时，需在 vLLM 的环境中设置相同的预留范围。
+`scripts/spdk_ipc_cpu_plan.py --reactors 32` 输出实际 CPU 列表与一一对应的 lcore map。
+可用 `IPC_TARGET_CPUS` 覆盖 CPU 列表，或用 `IPC_TARGET_CPU_BASE` 显式选择连续核；
+两者不能同时设置。自定义 `IPC_TARGET_LCORE_MAP` 必须使用匹配列表的 `i@cpu`
+一一映射格式，不支持把多个 lcore 绑定到同一 CPU 集合的 group map。
+不要把整个某个 NPU 的 CPU pool 都预留给 target，否则 worker 分配会报错。
+
 ### 4. 验证接管 & SPDK 能识别
 ```sh
 # 设备状态：84:00.0 的 Driver 应为 vfio-pci

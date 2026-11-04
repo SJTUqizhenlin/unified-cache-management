@@ -23,7 +23,7 @@
 # 用法（先在另一个终端起服务：./server_test_host.sh）：
 #   ./client_test_host.sh [--smoke-only] [--replay-only] [--stop-server]
 #   --stop-server：测试流程走完后自动停止本机对应端口的 server（SIGINT 优雅关闭
-#                 + 清理崩溃遗留的孤儿进程/泄漏 shm）；trace_replay 异常退出也会停
+#                 + 有界清理本轮子进程，不清理其它实例的孤儿进程/共享内存）；trace_replay 异常退出也会停
 #                 （结果是否采信看终端输出的 Benchmark Result 判定）
 #
 # 环境变量覆盖（例如测 plus 实例 / 调整回放规模）：
@@ -88,68 +88,17 @@ stop_server() {
     echo "  跳过：--stop-server 仅支持停止本机 server（HOST=$HOST）"
     return 0
   fi
-  # 按端口找本用户的 vllm serve master
-  # （comm=vllm 过滤很关键：pgrep -f "vllm serve" 会误匹配命令行里含该字样的 shell）
-  local master="" p cl
-  for p in $(pgrep -u "$(id -u)" -f "vllm serve" 2>/dev/null); do
-    [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == "vllm" ]] || continue
-    cl=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
-    if [[ "$cl" == *"--port $PORT"* ]]; then master=$p; break; fi
-  done
-  if [[ -z "$master" ]]; then
-    echo "==> 未找到端口 $PORT 对应的本用户 vllm 进程，无需停止"
-    return 0
-  fi
-
-  echo "==> 停止 server (pid $master, SIGINT 优雅关闭)"
-  kill -INT "$master" 2>/dev/null || true
-  local i
-  for i in $(seq 1 90); do
-    [[ -d /proc/$master ]] || break
-    sleep 1
-  done
-
-  # 未优雅退出 → 强杀整棵进程树（BFS 收集子孙，避免误伤其它实例）
-  if [[ -d /proc/$master ]]; then
-    echo "    90s 未退出，强制清理进程树"
-    local -a queue=("$master") all=("$master")
-    while [[ ${#queue[@]} -gt 0 && ${#all[@]} -lt 64 ]]; do
-      local -a next=()
-      local pid2 c
-      for pid2 in "${queue[@]}"; do
-        while read -r c; do
-          [[ -z "$c" ]] && continue
-          all+=("$c"); next+=("$c")
-        done < <(ps -o pid= --ppid "$pid2" 2>/dev/null)
-      done
-      queue=("${next[@]:-}")
-    done
-    kill -9 "${all[@]}" 2>/dev/null || true
-    sleep 2
-  fi
-
-  # 残留清理（与 server_test_host.sh 启动自检同款逻辑）：
-  # ① 孤儿进程（本用户 + PPID=1 的 Worker/EngineCore，Ctrl+C 崩溃遗留）② 未映射的泄漏 shm
-  sleep 3
-  local orphans
-  orphans=$(ps -eo pid=,ppid=,uid=,comm= 2>/dev/null | awk -v uid="$(id -u)" \
-    '$3==uid && $2==1 && $4 ~ /^VLLM::(Worker|EngineCor)/ {print $1}') || orphans=""
-  if [[ -n "$orphans" ]]; then
-    echo "    清理遗留孤儿进程: $(echo $orphans | tr '\n' ' ')"
-    kill $orphans 2>/dev/null || true
-    sleep 3
-    kill -9 $orphans 2>/dev/null || true
-  fi
-  local f gout gstat
-  for f in /dev/shm/uc_shm_cache*; do
-    [[ -e "$f" ]] || continue
-    gout=$(timeout 5 grep -lF "$f" /proc/[0-9]*/maps 2>/dev/null) && gstat=0 || gstat=$?
-    [[ "$gstat" == "124" ]] && continue
-    if [[ -z "$gout" && -O "$f" ]]; then
-      rm -f "$f"
-      echo "    清理泄漏 shm: $(basename "$f")"
+  local -a identity=()
+  if [[ -n "${UCM_HOST_SERVER_PID:-}" || -n "${UCM_HOST_SERVER_START_TIME:-}" ]]; then
+    identity+=(--pid "${UCM_HOST_SERVER_PID:-}" --start-time "${UCM_HOST_SERVER_START_TIME:-}")
+    if [[ -n "${UCM_HOST_SERVER_TOKEN:-}" ]]; then
+      identity+=(--token "$UCM_HOST_SERVER_TOKEN")
     fi
-  done
+  fi
+  # Standalone use discovers one exact owned vllm/port; chain use never falls
+  # back to another server if the supplied PID/starttime no longer matches.
+  echo "==> 停止本轮 server（SIGINT，必要时有界 TERM/KILL 清理）"
+  python "$REPO/scripts/host_server_process.py" stop --port "$PORT" "${identity[@]}"
 
   if ss -tln 2>/dev/null | grep -q ":$PORT "; then
     echo "    WARN: 端口 $PORT 仍被占用，请手动检查（ss -tlnp | grep $PORT）"

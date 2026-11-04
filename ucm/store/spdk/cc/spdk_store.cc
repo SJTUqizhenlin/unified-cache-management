@@ -183,6 +183,7 @@ class SpdkStore : public StoreV1 {
     HandleRegistry registry_;
     void* registeredHost_{nullptr};
     size_t registeredHostSize_{0};
+    int registeredHostFd_{-1};
 
     /* metric helpers (posix_* names for ucm_store_stats.sh compatibility) */
     static void Metric(const char *name, double value)
@@ -446,6 +447,27 @@ public:
                                     : Status::Error("spdk store unhealthy");
     }
 
+    Status RegisterHostMemoryFd(int fd, void* addr, size_t size,
+                                uint64_t file_offset) override
+    {
+        EngineScope scope(engine_);
+        if (lookupOnly_) { return Status::OK(); }
+        if (!initialized_ || fd < 0 || addr == nullptr || size == 0) {
+            return Status::InvalidParam("invalid SPDK host-memory fd registration");
+        }
+        auto rc = spdk_store_register_memory_fd(fd, addr, size, file_offset);
+        if (rc != 0) {
+            return Status::Error(fmt::format("spdk_mem_register_fd failed: {}", rc));
+        }
+        registeredHost_ = addr;
+        registeredHostSize_ = size;
+        registeredHostFd_ = fd;
+        UC_INFO("{}: registered Cache SHM fd={} [{}, {}) {} bytes for direct DMA",
+                kStoreName, fd, addr,
+                static_cast<void*>(static_cast<char*>(addr) + size), size);
+        return Status::OK();
+    }
+
     Status RegisterHostMemory(void* addr, size_t size) override
     {
         EngineScope scope(engine_);
@@ -464,6 +486,14 @@ public:
         return Status::OK();
     }
 
+    void UnregisterHostMemoryFd(int fd, void* addr, size_t size,
+                                uint64_t file_offset) override
+    {
+        (void)fd;
+        (void)file_offset;
+        UnregisterHostMemory(addr, size);
+    }
+
     void UnregisterHostMemory(void* addr, size_t size) override
     {
         EngineScope scope(engine_);
@@ -478,6 +508,7 @@ public:
         if (registeredHost_ == addr) {
             registeredHost_ = nullptr;
             registeredHostSize_ = 0;
+            registeredHostFd_ = -1;
         }
     }
 

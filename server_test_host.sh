@@ -22,6 +22,14 @@
 # 环境变量覆盖（例如同时起一个 "plus" 对比实例）：
 #   DEVICES=1,3,5,7 PORT=7880 CACHE_DIR=~/ucm-cache/test-plus ./server_test_host.sh
 #   NPU_BUSY_RETRY_SECONDS=1800 NPU_BUSY_MAX_RETRIES=0 KILL_ORPHANS=0 ./server_test_host.sh
+# IPC target placement is normally read from UCM_CONFIG as one line:
+#   spdk_trid: "ipc:<socket>|<target-trid>"
+#   e.g. "ipc:/tmp/ucm_spdk_ipc.sock|trtype:PCIe traddr:0000:84:00.0"
+# Legacy separate ipc_target_trid is still accepted.
+# Other target knobs (lcore map, reactors, cpu base, mem size, IOVA mode,
+# pidfile/log) keep script defaults and can be overridden by IPC_TARGET_*.
+# Defaults distribute 32 pollers across NUMA nodes; IPC_TARGET_CPUS overrides the list.
+# IPC targets on the configured socket are restarted before each server launch.
 
 # ---------------- 可调参数 ----------------
 UCM_ENABLED=1
@@ -40,6 +48,22 @@ UCM_CONFIG="$HOME/ucm-cache/ucm_config_$(basename "${CACHE_DIR%/}").yaml"
 KILL_ORPHANS="${KILL_ORPHANS:-0}"
 NPU_BUSY_RETRY_SECONDS="${NPU_BUSY_RETRY_SECONDS:-1800}"
 NPU_BUSY_MAX_RETRIES="${NPU_BUSY_MAX_RETRIES:-0}"
+# Optional local IPC target (used when spdk_trid starts with ipc:).  The
+# target owns the raw NVMe device; workers do not need vfio.
+IPC_TARGET_TRID="${IPC_TARGET_TRID:-}"
+IPC_TARGET_PCI_ADDR="${IPC_TARGET_PCI_ADDR:-}"
+IPC_TARGET_REACTORS="${IPC_TARGET_REACTORS:-32}"
+IPC_TARGET_CPUS="${IPC_TARGET_CPUS:-}"
+IPC_TARGET_CPU_BASE="${IPC_TARGET_CPU_BASE:-}"
+IPC_TARGET_LCORE_MAP="${IPC_TARGET_LCORE_MAP:-}"
+IPC_TARGET_MEM_MB="${IPC_TARGET_MEM_MB:-8192}"
+IPC_TARGET_IOVA_MODE="${IPC_TARGET_IOVA_MODE:-pa}"
+# Hugepage overhead beyond Cache payload and target memory, in MiB.
+IPC_HUGEPAGE_RESERVE_MB="${IPC_HUGEPAGE_RESERVE_MB:-2048}"
+# Optional override for shared-total (1) versus per-rank Cache copies.
+IPC_CACHE_MULTIPLIER="${IPC_CACHE_MULTIPLIER:-}"
+IPC_TARGET_PIDFILE="${IPC_TARGET_PIDFILE:-$HOME/ucm-cache/ucm_spdk_ipc_target.pid}"
+IPC_TARGET_LOG="${IPC_TARGET_LOG:-$HOME/ucm-logs/ucm_spdk_ipc_target.log}"
 
 usage() {
   echo "Usage: $0 [--ucm on|off]"
@@ -142,32 +166,30 @@ else
   echo "    ✓ 无孤儿进程"
 fi
 
-# b) /dev/shm 残留：用 /proc/*/maps 判断是否仍被存活进程映射
-#    未映射 → 上次崩溃的泄漏（曾出现过 100GB tmpfs 泄漏）→ 清理本用户的
-#    仍被映射 → 别的 UCM 实例正在运行 → 只提示、绝不删除（文件名含 per-instance UUID，不冲突）
-#    注意：grep 读他人进程的 maps 会权限拒绝（exit 2），映射内容仍有效；
-#         扫描超时（D 状态进程持锁）则保守视为 LIVE 不删除 —— 两者都不能让 set -e 杀脚本
-SHM_STALE=0
-for f in /dev/shm/uc_shm_cache*; do
-  [[ -e "$f" ]] || continue
-  gout=$(timeout 5 grep -lF "$f" /proc/[0-9]*/maps 2>/dev/null) && gstat=0 || gstat=$?
-  if [[ "$gstat" == "124" ]]; then
-    echo "    注意: $f 映射扫描超时（有进程处于 D 状态持锁），保守跳过不删除"
-    continue
-  fi
-  mapped=$(sed -E 's#/proc/([0-9]+)/.*#\1#' <<< "$gout" | awk 'NR<=3')
-  if [[ -n "$mapped" ]]; then
-    echo "    注意: $f 仍被进程 $(echo $mapped | tr '\n' ' ') 使用（其它 UCM 实例在运行，跳过）"
-  elif [[ -O "$f" ]]; then
-    rm -f "$f"; SHM_STALE=1
-  else
-    echo "    注意: $f 为他人遗留且无进程使用（不动他人的文件）"
-  fi
-done
-if [[ "$SHM_STALE" == "1" ]]; then
-  echo "    ✓ 已清理本用户残留 shm（上次未正常退出的泄漏）"
+# b) Clean only this user's unused Cache files, including explicit hugepages.
+# sudo lets the inode-based maps/FD check see root IPC target mappings too.
+cache_cleanup_dirs=(--directory /dev/shm --directory /dev/hugepages)
+if [[ -f "$UCM_CONFIG" ]]; then
+  cache_hugepage_dirs=$(python - "$UCM_CONFIG" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1]) as stream:
+    config = yaml.safe_load(stream)
+for entry in config.get("ucm_connectors", []):
+    cfg = entry.get("ucm_connector_config", {})
+    if cfg.get("shm_use_hugepage_file"):
+        print(cfg.get("shm_hugepage_dir", "/dev/hugepages"))
+PY
+  )
+  while IFS= read -r directory; do
+    [[ -z "$directory" ]] || cache_cleanup_dirs+=(--directory "$directory")
+  done <<< "$cache_hugepage_dirs"
 fi
-ls /dev/shm/uc_shm_cache* >/dev/null 2>&1 || echo "    ✓ /dev/shm 无 uc_shm_cache 残留"
+if ! timeout 20s sudo -n python3 "$REPO/scripts/cleanup_cache_files.py" \
+    --uid "$(id -u)" "${cache_cleanup_dirs[@]}"; then
+  echo "    WARN: Cache 残留检查未完成，保守保留文件；后续大页预检仍会检查可用容量" >&2
+fi
 
 # c) 所选 NPU 的 HBM 基线检查（基线约 3.4GB；>8GB 视为被占用）
 #    注：npu-smi 表格中每张卡两行 —— 第一行含 NPU 编号，第二行（含 Bus-Id）才有 HBM
@@ -301,22 +323,238 @@ if [[ "$UCM_ENABLED" == "1" ]]; then
     exit 1
   fi
 
-  # The local NVMe-oF target must be ready before SPDK workers initialize.
-  SPDK_ENABLED=$(python - "$UCM_CONFIG" <<'PY'
+  # The selected SPDK backend must be ready before SPDK workers initialize.
+  SPDK_INFO=$(python - "$UCM_CONFIG" <<'PY'
 import sys
 import yaml
 
 with open(sys.argv[1]) as f:
     config = yaml.safe_load(f)
-print(int(any(
-    "spdk" in entry.get("ucm_connector_config", {}).get("store_pipeline", "").lower().split("|")
-    for entry in config.get("ucm_connectors", [])
-)))
+enabled = 0
+trid = ""
+target = {}
+target_keys = (
+    "ipc_target_trid",
+)
+for entry in config.get("ucm_connectors", []):
+    cfg = entry.get("ucm_connector_config", {})
+    pipeline = str(cfg.get("store_pipeline", "")).lower().split("|")
+    if "spdk" in pipeline:
+        enabled = 1
+        trid = str(cfg.get("spdk_trid", "")).strip()
+        target = {key: cfg.get(key, "") for key in target_keys}
+        break
+print("\x1f".join([str(enabled), trid] + [str(target.get(key, "")) for key in target_keys]))
 PY
   )
+  IFS=$'\x1f' read -r SPDK_ENABLED SPDK_TRID Y_IPC_TRID <<< "$SPDK_INFO"
+  IPC_TARGET_TRID="${IPC_TARGET_TRID:-$Y_IPC_TRID}"
   if [[ "$SPDK_ENABLED" == "1" ]]; then
-    echo "==> SPDK 配置：确保本机 nvmf-loop target 已启动"
-    sudo "$REPO/testSPDK/nvmf_loop.sh" start
+    if [[ "$SPDK_TRID" == ipc:* ]]; then
+      IPC_SPEC="${SPDK_TRID#ipc:}"
+      IPC_SOCKET="${IPC_SPEC%%|*}"
+      if [[ "$IPC_SPEC" == *'|'* && -z "$IPC_TARGET_TRID" ]]; then
+        IPC_TARGET_TRID="${IPC_SPEC#*|}"
+      fi
+      if [[ -z "$IPC_TARGET_PCI_ADDR" && -n "$IPC_TARGET_TRID" ]]; then
+        IPC_TARGET_PCI_ADDR=$(sed -n 's/.*traddr:\([^ ]*\).*/\1/p' <<< "$IPC_TARGET_TRID")
+      fi
+      if [[ -z "$IPC_SOCKET" ]]; then
+        echo "ERROR: spdk_trid 是 ipc: 但没有提供 socket 路径" >&2
+        exit 1
+      fi
+      if [[ -z "$IPC_TARGET_TRID" || -z "$IPC_TARGET_PCI_ADDR" ]]; then
+        echo "ERROR: 使用 ipc: 时必须提供 target 设备，例如 spdk_trid: 'ipc:/tmp/ucm_spdk_ipc.sock|trtype:PCIe traddr:0000:84:00.0'" >&2
+        exit 1
+      fi
+      # Use the same NUMA-interleaved list for DPDK, pollers and worker exclusion.
+      cpu_plan_args=(--reactors "$IPC_TARGET_REACTORS")
+      [[ -z "$IPC_TARGET_CPUS" ]] || cpu_plan_args+=(--cpus "$IPC_TARGET_CPUS")
+      [[ -z "$IPC_TARGET_CPU_BASE" ]] || cpu_plan_args+=(--cpu-base "$IPC_TARGET_CPU_BASE")
+      [[ -z "$IPC_TARGET_LCORE_MAP" ]] || cpu_plan_args+=(--lcore-map "$IPC_TARGET_LCORE_MAP")
+      cpu_plan=$(python "$REPO/scripts/spdk_ipc_cpu_plan.py" "${cpu_plan_args[@]}")
+      mapfile -t cpu_plan_lines <<< "$cpu_plan"
+      IPC_TARGET_CPUS="${cpu_plan_lines[0]}"
+      IPC_TARGET_LCORE_MAP="${cpu_plan_lines[1]}"
+      export UCM_IPC_TARGET_CPUS="$IPC_TARGET_CPUS"
+      echo "==> SPDK 配置：本地 IPC target ($IPC_SOCKET)"
+      if [[ ! -x "$REPO/testSPDK/ucm_spdk_ipc/ucm_spdk_ipc_target" ]]; then
+        echo "ERROR: 缺少 IPC target 二进制：$REPO/testSPDK/ucm_spdk_ipc/ucm_spdk_ipc_target" >&2
+        echo "       先执行：make -C testSPDK/ucm_spdk_ipc -j" >&2
+        exit 1
+      fi
+
+      # Match executable and socket arguments, not a stale/reused pidfile PID.
+      # Restarting this target also disconnects any other workers sharing it.
+      echo "    重启 IPC target；共享此 socket 的其他 worker 将断开连接"
+      sudo python3 - "$IPC_SOCKET" <<'PY'
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+socket_path = sys.argv[1]
+
+def identity(pid):
+    try:
+        proc = Path("/proc") / str(pid)
+        args = (proc / "cmdline").read_bytes().split(b"\0")
+        if not args or os.path.basename(os.fsdecode(args[0])) != "ucm_spdk_ipc_target":
+            return None
+        sockets = [os.fsdecode(args[i + 1]) for i, arg in enumerate(args[:-1])
+                   if arg == b"--socket"]
+        sockets += [os.fsdecode(arg.split(b"=", 1)[1]) for arg in args
+                    if arg.startswith(b"--socket=")]
+        if socket_path not in sockets:
+            return None
+        return (proc / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+targets = {}
+for proc in Path("/proc").iterdir():
+    if proc.name.isdigit():
+        pid = int(proc.name)
+        token = identity(pid)
+        if token is not None:
+            targets[pid] = token
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    for pid, token in targets.items():
+        if identity(pid) == token:
+            print(f"    stopping IPC target pid={pid} signal={sig.name}", flush=True)
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + (10 if sig == signal.SIGTERM else 5)
+    while any(identity(pid) == token for pid, token in targets.items()):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+if any(identity(pid) == token for pid, token in targets.items()):
+    sys.exit("ERROR: old IPC target did not exit; refusing to start another")
+PY
+
+        # Starting the IPC target requires exclusive ownership of the NVMe.
+        if systemctl is-active --quiet nvmf-loop; then
+          echo "    停止 nvmf-loop，释放 $IPC_TARGET_PCI_ADDR ..."
+          sudo "$REPO/testSPDK/nvmf_loop.sh" stop
+        fi
+        driver=""
+        if [[ -e "/sys/bus/pci/devices/$IPC_TARGET_PCI_ADDR/driver" ]]; then
+          driver=$(basename "$(readlink -f "/sys/bus/pci/devices/$IPC_TARGET_PCI_ADDR/driver")")
+        fi
+        if [[ "$driver" != "vfio-pci" ]]; then
+          echo "ERROR: $IPC_TARGET_PCI_ADDR 当前驱动为 '${driver:-none}'，IPC target 需要 vfio-pci。" >&2
+          echo "       先按 testSPDK/SPDK_BUILD_INSTALL.md 执行 setup.sh config 绑定 vfio。" >&2
+          exit 1
+        fi
+        # DeepSeek MLA ranks share a UUID-backed Cache; other layouts are
+        # conservatively budgeted per device unless explicitly overridden.
+        ipc_cache_multiplier="$IPC_CACHE_MULTIPLIER"
+        if [[ -z "$ipc_cache_multiplier" ]]; then
+          ipc_cache_multiplier=$(python - "$MODEL/config.json" "$TP" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    model = json.load(stream)
+shared = model.get("model_type") in {"deepseek_v2", "deepseek_v3", "deepseek_v4"}
+print(1 if shared else int(sys.argv[2]))
+PY
+          )
+        fi
+        python "$REPO/scripts/ensure_spdk_hugepages.py" \
+          --config "$UCM_CONFIG" --target-mem-mb "$IPC_TARGET_MEM_MB" \
+          --devices "$DEVICES" --setup-script "$SPDK_ROOT_DIR/scripts/setup.sh" \
+          --reserve-mb "$IPC_HUGEPAGE_RESERVE_MB" \
+          --cache-multiplier "$ipc_cache_multiplier"
+        mkdir -p "$(dirname "$IPC_TARGET_LOG")" "$(dirname "$IPC_TARGET_PIDFILE")"
+        sudo rm -f -- "$IPC_TARGET_PIDFILE"
+        if [[ -S "$IPC_SOCKET" ]]; then sudo rm -f -- "$IPC_SOCKET"; fi
+        IPC_CMD=(
+          "$REPO/testSPDK/ucm_spdk_ipc/ucm_spdk_ipc_target"
+          --trid "$IPC_TARGET_TRID"
+          --socket "$IPC_SOCKET"
+          --lcore-map "$IPC_TARGET_LCORE_MAP"
+          --reactors "$IPC_TARGET_REACTORS"
+          --cpus "$IPC_TARGET_CPUS"
+          --mem-size "$IPC_TARGET_MEM_MB"
+          --iova-mode "$IPC_TARGET_IOVA_MODE"
+        )
+        echo "    启动 IPC target: ${IPC_CMD[*]}"
+        sudo bash -c 'umask 022; echo $$ > "$1"; log=$2; shift 2; exec "$@" > "$log" 2>&1' \
+          bash "$IPC_TARGET_PIDFILE" "$IPC_TARGET_LOG" "${IPC_CMD[@]}" </dev/null &
+        ipc_launcher_pid=$!
+        for _ in $(seq 1 40); do
+          [[ -S "$IPC_SOCKET" ]] && break
+          sleep 1
+        done
+        ipc_pid=$(cat "$IPC_TARGET_PIDFILE" 2>/dev/null || true)
+        if [[ ! -S "$IPC_SOCKET" ]] || [[ -z "$ipc_pid" ]] ||
+           ! ps -p "$ipc_pid" >/dev/null 2>&1; then
+          echo "ERROR: IPC target 未正常启动（socket=$IPC_SOCKET pid=${ipc_pid:-unknown}），日志尾部：" >&2
+          sudo tail -40 "$IPC_TARGET_LOG" >&2 || true
+          # A failed readiness check must not leave a late-starting target behind.
+          sudo python3 - "$IPC_TARGET_PIDFILE" <<'PY'
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+try:
+    pid = int(Path(sys.argv[1]).read_text().strip())
+    proc = Path("/proc") / str(pid)
+    token = (proc / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if (proc / "stat").read_text().rsplit(")", 1)[1].split()[19] != token:
+            break
+        if Path(os.readlink(proc / "exe")).name != "ucm_spdk_ipc_target":
+            break
+        os.kill(pid, sig)
+        time.sleep(1)
+except (OSError, ValueError, IndexError):
+    pass
+PY
+          kill -TERM -- "$ipc_launcher_pid" 2>/dev/null || true
+          sudo rm -f -- "$IPC_TARGET_PIDFILE"
+          exit 1
+        fi
+        echo "    ✓ IPC target 已就绪 (pid $ipc_pid, log $IPC_TARGET_LOG)"
+      if [[ ! -r "$IPC_SOCKET" || ! -w "$IPC_SOCKET" ]]; then
+        echo "    修正 IPC socket 权限以允许当前用户 $(id -un) 访问: $IPC_SOCKET"
+        sudo chmod 0666 "$IPC_SOCKET"
+        if [[ ! -r "$IPC_SOCKET" || ! -w "$IPC_SOCKET" ]]; then
+          echo "ERROR: IPC socket 仍不可访问: $IPC_SOCKET" >&2
+          exit 1
+        fi
+      fi
+    else
+      echo "==> SPDK 配置：确保本机 nvmf-loop target 已启动"
+      sudo "$REPO/testSPDK/nvmf_loop.sh" start
+    fi
+  fi
+
+  # Cache|Empty still allocates the same host Cache, even without an IPC target.
+  if [[ "$SPDK_ENABLED" != "1" ]]; then
+    cache_multiplier="${IPC_CACHE_MULTIPLIER:-}"
+    if [[ -z "$cache_multiplier" ]]; then
+      cache_multiplier=$(python - "$MODEL/config.json" "$TP" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    model = json.load(stream)
+print(1 if model.get("model_type") in {"deepseek_v2", "deepseek_v3", "deepseek_v4"} else int(sys.argv[2]))
+PY
+      )
+    fi
+    python "$REPO/scripts/ensure_spdk_hugepages.py" \
+      --config "$UCM_CONFIG" --target-mem-mb 0 --devices "$DEVICES" \
+      --setup-script "$SPDK_ROOT_DIR/scripts/setup.sh" \
+      --reserve-mb "$IPC_HUGEPAGE_RESERVE_MB" --cache-multiplier "$cache_multiplier"
   fi
 
   UCM_ARGS=(

@@ -54,6 +54,8 @@ struct Config {
     size_t loadExclusiveBufferNumber{1024};
     bool shareBufferEnable{true};
     bool shmHugepageAdvise{false};
+    bool shmUseHugepageFile{false};
+    std::string shmHugepageDir{"/dev/hugepages"};
     size_t waitingQueueDepth{8192};
     size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};

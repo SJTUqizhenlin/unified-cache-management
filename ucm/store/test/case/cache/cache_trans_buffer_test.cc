@@ -21,7 +21,13 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <cerrno>
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <memory>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "cache/cc/trans_buffer.h"
 #include "detail/random.h"
 #include "detail/types_helper.h"
@@ -206,6 +212,58 @@ TEST(UCCacheTransBufferSharedTest, SharesFailureAcrossMappings)
     ASSERT_FALSE(waiter.Owner());
     ASSERT_EQ(waiter.GetState(), TransBuffer::State::FAILED);
     ASSERT_EQ(waiter.FailureStatus(), UC::Status::NotFound());
+}
+
+TEST(UCCacheTransBufferSharedTest, HostFdMapsDataOffsetAndOutlivesBufferMapping)
+{
+    UC::Test::Detail::Random rd;
+    UC::CacheStore::Config config;
+    config.uniqueId = rd.RandomString(10);
+    config.shardSize = 4096;
+    config.bufferCapacity = config.shardSize * 4;
+    config.shareBufferEnable = true;
+    config.deviceId = 0;
+    config.loadExclusiveBufferNumber = 0;
+    std::shared_ptr<void> mapping;
+    int fd = -1;
+    size_t size = 0;
+    {
+        UC::CacheStore::TransBuffer transBuffer;
+        ASSERT_EQ(transBuffer.Setup(config), UC::Status::OK());
+        fd = transBuffer.HostFd();
+        ASSERT_GE(fd, 0);
+        EXPECT_EQ(fcntl(fd, F_GETFD) & FD_CLOEXEC, FD_CLOEXEC);
+        size = transBuffer.HostDataSize();
+        ASSERT_EQ(size, config.bufferCapacity);
+        const auto offset = transBuffer.HostFileOffset();
+        ASSERT_GT(offset, uint64_t{0});
+        EXPECT_EQ(offset % sysconf(_SC_PAGESIZE), uint64_t{0});
+        struct stat info {};
+        ASSERT_EQ(fstat(fd, &info), 0);
+        ASSERT_GE(static_cast<uint64_t>(info.st_size), offset + size);
+        auto* addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+        ASSERT_NE(addr, MAP_FAILED);
+        mapping = std::shared_ptr<void>(addr, [size](void* ptr) { munmap(ptr, size); });
+        auto* host = static_cast<uint8_t*>(transBuffer.HostData());
+        auto* mapped = static_cast<uint8_t*>(mapping.get());
+        host[0] = 0x31;
+        host[size - 1] = 0x72;
+        EXPECT_EQ(mapped[0], 0x31);
+        EXPECT_EQ(mapped[size - 1], 0x72);
+        mapped[1] = 0x53;
+        EXPECT_EQ(host[1], 0x53);
+    }
+
+    errno = 0;
+    EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    // A receiver's mmap stays valid after the sender closes and unmaps its buffer.
+    auto* mapped = static_cast<uint8_t*>(mapping.get());
+    EXPECT_EQ(mapped[0], 0x31);
+    EXPECT_EQ(mapped[1], 0x53);
+    EXPECT_EQ(mapped[size - 1], 0x72);
+    mapped[1] = 0x64;
+    EXPECT_EQ(mapped[1], 0x64);
 }
 
 TEST_P(UCCacheTransBufferTest, GetReservedNode)

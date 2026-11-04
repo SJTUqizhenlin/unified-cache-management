@@ -67,6 +67,8 @@ public:
     TransBuffer* GetTransBuffer() { return buffer_ ? buffer_.get() : nullptr; }
     void* HostData() { return buffer_ ? buffer_->HostData() : nullptr; }
     size_t HostDataSize() { return buffer_ ? buffer_->HostDataSize() : 0; }
+    int HostFd() const { return buffer_ ? buffer_->HostFd() : -1; }
+    uint64_t HostFileOffset() const { return buffer_ ? buffer_->HostFileOffset() : 0; }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num)
     {
         if (!buffer_ || loadBackendOnly_) { return LookupThrough<&StoreV1::Lookup>(blocks, num); }

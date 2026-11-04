@@ -149,10 +149,29 @@ public:
         (void)size;
         return Status::OK();
     }
+    /**
+     * fd-aware variant used by backends that hand the shared buffer to a
+     * separate process (for example the local IPC SPDK target).  The default
+     * implementation keeps existing backends unchanged.
+     */
+    virtual Status RegisterHostMemoryFd(int fd, void* addr, size_t size,
+                                        uint64_t file_offset)
+    {
+        (void)fd;
+        (void)file_offset;
+        return RegisterHostMemory(addr, size);
+    }
     virtual void UnregisterHostMemory(void* addr, size_t size)
     {
         (void)addr;
         (void)size;
+    }
+    virtual void UnregisterHostMemoryFd(int fd, void* addr, size_t size,
+                                        uint64_t file_offset)
+    {
+        (void)fd;
+        (void)file_offset;
+        UnregisterHostMemory(addr, size);
     }
 
     /**

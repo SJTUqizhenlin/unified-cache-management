@@ -350,14 +350,24 @@ now_ms(void)
  * geometry: the scheduler process has no geometry at all (the Cache
  * stage exempts it from size checks) yet must attach the same shared
  * index, and a geometry change (model switch) reuses the same segment
- * and rebuilds it via recovery. */
+ * and rebuilds it via recovery. IPC identity is the full socket string +
+ * offset, not the ignored target suffix. Socket aliases are distinct identities;
+ * workers sharing a target must use the same socket string. */
 static void
 build_shm_names(void)
 {
 	uint64_t h = 1469598103934665603ULL;
 	const uint8_t *p = (const uint8_t *)&g_trid;
+	size_t len = sizeof(g_trid);
 
-	for (size_t i = 0; i < sizeof(g_trid); i++) {
+	if (g_ipc_mode) {
+		for (size_t i = 0; i < 4; i++) {
+			h = (h ^ (uint8_t)"ipc:"[i]) * 1099511628211ULL;
+		}
+		p = (const uint8_t *)g_ipc_socket;
+		len = strlen(g_ipc_socket);
+	}
+	for (size_t i = 0; i < len; i++) {
 		h = (h ^ p[i]) * 1099511628211ULL;
 	}
 	for (size_t i = 0; i < sizeof(g_offset_gib); i++) {
@@ -372,6 +382,23 @@ build_shm_names(void)
 static int
 store_parse_region(const char *trid_str, uint64_t offset_gib)
 {
+	if (trid_str != NULL && strncmp(trid_str, "ipc:", 4) == 0) {
+		const char *socket = trid_str + 4;
+		const char *sep = strchr(socket, '|');
+		size_t n = sep == NULL ? strlen(socket) : (size_t)(sep - socket);
+
+		if (n == 0) { return -EINVAL; }
+		if (n >= sizeof(g_ipc_socket)) { return -ENAMETOOLONG; }
+		g_ipc_mode = 1;
+		memcpy(g_ipc_socket, socket, n);
+		g_ipc_socket[n] = '\0';
+		memset(&g_trid, 0, sizeof(g_trid));
+		g_offset_gib = offset_gib;
+		build_shm_names();
+		return 0;
+	}
+	g_ipc_mode = 0;
+	g_ipc_socket[0] = '\0';
 	memset(&g_trid, 0, sizeof(g_trid));
 	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
 	snprintf(g_trid.traddr, sizeof(g_trid.traddr), "0000:84:00.0");
@@ -384,6 +411,148 @@ store_parse_region(const char *trid_str, uint64_t offset_gib)
 	build_shm_names();
 	return 0;
 }
+
+static int
+store_ipc_meta_setup(void)
+{
+	int flags = MFD_CLOEXEC;
+	size_t size = 2ULL << 20;
+
+#ifdef MFD_HUGETLB
+	flags |= MFD_HUGETLB;
+#ifdef MFD_HUGE_2MB
+	flags |= MFD_HUGE_2MB;
+#endif
+#endif
+	g_meta_size = size;
+	g_meta_fd = memfd_create("ucm_spdk_meta", flags);
+	if (g_meta_fd < 0) {
+		return -errno;
+	}
+	if (ftruncate(g_meta_fd, (off_t)size) != 0) {
+		int rc = -errno;
+		close(g_meta_fd);
+		g_meta_fd = -1;
+		return rc;
+	}
+	g_meta_base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, g_meta_fd, 0);
+	if (g_meta_base == MAP_FAILED) {
+		int rc = -errno;
+		g_meta_base = NULL;
+		close(g_meta_fd);
+		g_meta_fd = -1;
+		return rc;
+	}
+	memset(g_meta_base, 0, size);
+	return 0;
+}
+
+static int
+store_ipc_connect(void)
+{
+	int rc;
+
+	rc = ucm_ipc_client_init(&g_ipc, g_ipc_socket, g_meta_fd, g_meta_size, 0,
+				 IO_POOL_BUFS, -1, "ucm-spdk-worker", "SPDK");
+	if (rc != 0) {
+		return rc;
+	}
+	g_sector_size = (uint32_t)g_ipc.sector_size;
+	g_num_sectors = g_ipc.num_sectors;
+	g_ipc_ready = 1;
+	return 0;
+}
+
+static int
+store_ipc_buf_region(const void *buf, size_t len, uint32_t *region_id,
+		     uint64_t *offset)
+{
+	uintptr_t p = (uintptr_t)buf;
+
+	if (g_meta_base != NULL && p >= (uintptr_t)g_meta_base &&
+	    p + len <= (uintptr_t)g_meta_base + g_meta_size) {
+		*region_id = 0;
+		*offset = p - (uintptr_t)g_meta_base;
+		return 0;
+	}
+	if (g_cache_base != NULL && p >= (uintptr_t)g_cache_base &&
+	    p + len <= (uintptr_t)g_cache_base + g_cache_size) {
+		*region_id = 1;
+		*offset = p - (uintptr_t)g_cache_base;
+		return 0;
+	}
+	return -EFAULT;
+}
+
+static void
+ipc_bridge_complete(void *arg, int status)
+{
+	struct ipc_cb_bridge *b = arg;
+	spdk_nvme_cmd_cb cb = b->cb;
+	void *cb_arg = b->arg;
+	struct spdk_nvme_cpl cpl;
+
+	memset(&cpl, 0, sizeof(cpl));
+	if (status != 0) {
+		cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+		cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+	}
+	g_last_progress = spdk_get_ticks();
+	ENGINE->ipc_bridge_free[ENGINE->ipc_bridge_free_top++] =
+		(uint32_t)(b - ENGINE->ipc_bridges);
+	/* Return the slot before invoking a callback that may submit more I/O. */
+	cb(cb_arg, &cpl);
+}
+
+static int
+store_submit_rw(uint64_t lba, uint32_t nlbas, void *buf, int is_write,
+		spdk_nvme_cmd_cb cb, void *arg)
+{
+	uint32_t region_id;
+	uint64_t data_offset;
+	uint32_t nbytes;
+	int rc;
+
+	if (!g_ipc_mode) {
+		if (is_write) {
+			return spdk_nvme_ns_cmd_write(g_ns, g_qpair, buf, lba, nlbas,
+						      cb, arg, 0);
+		}
+		return spdk_nvme_ns_cmd_read(g_ns, g_qpair, buf, lba, nlbas,
+					     cb, arg, 0);
+	}
+	if (nlbas == 0 || nlbas > UINT32_MAX / g_sector_size) {
+		return -EINVAL;
+	}
+	nbytes = nlbas * g_sector_size;
+	rc = store_ipc_buf_region(buf, nbytes, &region_id, &data_offset);
+	if (rc != 0) {
+		return rc;
+	}
+	if (cb == NULL) {
+		uint64_t req_id;
+
+		rc = ucm_ipc_client_submit(&g_ipc, region_id,
+					   is_write ? UCM_IPC_OP_WRITE : UCM_IPC_OP_READ,
+					   lba * (uint64_t)g_sector_size, data_offset,
+					   nbytes, &req_id);
+		return rc;
+	}
+	if (ENGINE->ipc_bridge_free_top == 0) { return -EBUSY; }
+	uint32_t bridge_id = ENGINE->ipc_bridge_free[--ENGINE->ipc_bridge_free_top];
+	struct ipc_cb_bridge *bridge = &ENGINE->ipc_bridges[bridge_id];
+	bridge->cb = cb;
+	bridge->arg = arg;
+	rc = ucm_ipc_client_submit_cb(&g_ipc, region_id,
+				      is_write ? UCM_IPC_OP_WRITE : UCM_IPC_OP_READ,
+				      lba * (uint64_t)g_sector_size, data_offset,
+				      nbytes, ipc_bridge_complete, bridge, NULL);
+	if (rc != 0) {
+		ENGINE->ipc_bridge_free[ENGINE->ipc_bridge_free_top++] = bridge_id;
+	}
+	return rc;
+}
+
 
 static int
 store_maintenance_open(int exclusive)
@@ -566,8 +735,9 @@ check_shm_hugepage_advise(void)
 	return 0;
 }
 
+/* No liveness maintenance here: maintenance itself needs this checked lock. */
 static void
-shm_lock(void)
+shm_lock_checked(void)
 {
 	int rc = pthread_mutex_lock(&g_shm->lock);
 
@@ -590,24 +760,56 @@ shm_lock(void)
 		fprintf(stderr, "shared index requires recovery; restart workers\n");
 		abort();
 	}
-	if (!g_shm_recovering) {
-		for (int i = 0; i < MAX_WORKERS; i++) {
-			pid_t pid = g_shm->workers[i];
-
-			if (pid > 0 && pid != getpid() && kill(pid, 0) != 0 && errno == ESRCH) {
-				g_shm->recovery_required = 1;
-				pthread_mutex_unlock(&g_shm->lock);
-				fprintf(stderr, "worker %d died; restart workers to recover shared state\n", pid);
-				abort();
-			}
-		}
-	}
 }
 
 static void
 shm_unlock(void)
 {
 	pthread_mutex_unlock(&g_shm->lock);
+}
+
+/* At most one scan per second per attachment. Active reactors/accesses detect
+ * death on the next maintenance interval; idle lookup-only attachments check
+ * on their next access. kill(0) cannot distinguish an already reused PID.
+ * Keep probes outside the shared lock and revalidate the slot before failing. */
+static void
+shm_worker_maintenance(void)
+{
+	struct timespec ts;
+	pid_t workers[MAX_WORKERS], self;
+	uint64_t now, next;
+
+	if (g_shm == NULL || g_shm_recovering) { return; }
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) { abort(); }
+	now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+	next = atomic_load_explicit(&ENGINE->worker_check_after_ns, memory_order_relaxed);
+	if (now < next || !atomic_compare_exchange_strong_explicit(
+			&ENGINE->worker_check_after_ns, &next, now + 1000000000ULL,
+			memory_order_relaxed, memory_order_relaxed)) { return; }
+	shm_lock_checked();
+	memcpy(workers, g_shm->workers, sizeof(workers));
+	shm_unlock();
+	self = getpid();
+	for (int i = 0; i < MAX_WORKERS; i++) {
+		pid_t pid = workers[i];
+
+		if (pid <= 0 || pid == self || kill(pid, 0) == 0 || errno != ESRCH) { continue; }
+		shm_lock_checked();
+		if (g_shm->workers[i] == pid) {
+			g_shm->recovery_required = 1;
+			shm_unlock();
+			fprintf(stderr, "worker %d died; restart workers to recover shared state\n", pid);
+			abort();
+		}
+		shm_unlock();
+	}
+}
+
+static void
+shm_lock(void)
+{
+	shm_worker_maintenance();
+	shm_lock_checked();
 }
 
 static uint32_t
@@ -665,6 +867,7 @@ shm_open_segment(int create, int adopt_capacity)
 	}
 	g_shm_fd = fd;
 	g_shm = (struct shm_header *)g_shm_base;
+	atomic_store_explicit(&ENGINE->worker_check_after_ns, 0, memory_order_relaxed);
 
 	if (create) {
 		pthread_mutexattr_t attr;
@@ -776,6 +979,7 @@ shm_close_segment(void)
 		g_shm_fd = -1;
 	}
 	g_shm_recovering = 0;
+	atomic_store_explicit(&ENGINE->worker_check_after_ns, 0, memory_order_relaxed);
 }
 
 /* ---------------- hashing ---------------- */
@@ -940,8 +1144,36 @@ store_io_pool_init(void)
 	const char *stage = "qpair";
 	int index = -1;
 	struct spdk_nvme_io_qpair_opts qopts;
-	uint32_t max_xfer = spdk_nvme_ns_get_max_io_xfer_size(g_ns);
+	uint32_t max_xfer;
+	size_t meta_used;
 
+	if (g_ipc_mode) {
+		g_recov_batch = RECOV_BATCH_MAX;
+		ENGINE->ipc_bridge_free_top = IPC_BRIDGE_COUNT;
+		for (uint32_t i = 0; i < IPC_BRIDGE_COUNT; i++) {
+			ENGINE->ipc_bridge_free[i] = i;
+		}
+		g_io_pool_count = IO_POOL_BUFS;
+		g_bounce_pool_count = 0;
+		g_meta_buf = g_meta_base;
+		if (g_meta_buf == NULL) { return -ENODEV; }
+		meta_used = (size_t)g_recov_batch * g_sector_size +
+			    (size_t)NUM_IDX_BUFS * g_sector_size;
+		if (meta_used > g_meta_size) { return -ENOSPC; }
+		g_idx_bufs = calloc(NUM_IDX_BUFS, sizeof(void *));
+		if (g_idx_bufs == NULL) { return -ENOMEM; }
+		for (uint32_t i = 0; i < NUM_IDX_BUFS; i++) {
+			g_idx_bufs[i] = g_meta_base + (size_t)g_recov_batch * g_sector_size +
+					(size_t)i * g_sector_size;
+			g_idx_free[g_idx_free_top++] = i;
+		}
+		for (uint32_t i = 0; i < g_io_pool_count; i++) {
+			g_io_free[g_io_free_top++] = i;
+		}
+		return 0;
+	}
+
+	max_xfer = spdk_nvme_ns_get_max_io_xfer_size(g_ns);
 	if (!g_direct_only && count == 0) {
 		fprintf(stderr, "IO pool shard_bytes=%zu exceeds bounce budget=%ju; "
 			"configure direct-only mode before init\n", bytes, (uintmax_t)IO_POOL_BYTES);
@@ -1100,8 +1332,7 @@ submit_record_write(uint32_t slot, const uint8_t id[16], uint64_t epoch,
 		    void (*cb)(void *, const struct spdk_nvme_cpl *))
 {
 	build_record(buf, slot, id, epoch, flags);
-	return spdk_nvme_ns_cmd_write(g_ns, g_qpair, buf, record_lba(slot), 1,
-				      cb, cb_arg, 0);
+	return store_submit_rw(record_lba(slot), 1, buf, 1, cb, cb_arg);
 }
 
 static void
@@ -1686,12 +1917,9 @@ advance_dumps(void)
 				reg_rc = ensure_registered(src, shard_bytes());
 				if (reg_rc == 0) {
 					/* direct DMA to caller's buffer */
-					rc = spdk_nvme_ns_cmd_write(g_ns, g_qpair,
-								    src,
-								    shard_lba(dc->slot, shard),
-								    g_shard_sectors,
-								    dump_shard_done,
-								    &g_sios[tok], 0);
+					rc = store_submit_rw(shard_lba(dc->slot, shard),
+							     g_shard_sectors, (void *)src, 1,
+							     dump_shard_done, &g_sios[tok]);
 				} else if (reg_rc == 1) {
 					/* fallback: bounce via internal buffer */
 					int bounce = bounce_buf_pop();
@@ -1701,12 +1929,9 @@ advance_dumps(void)
 					}
 					g_sios[tok].bounce = bounce;
 					memcpy(g_io_bufs[bounce], src, shard_bytes());
-					rc = spdk_nvme_ns_cmd_write(g_ns, g_qpair,
-								    g_io_bufs[bounce],
-								    shard_lba(dc->slot, shard),
-								    g_shard_sectors,
-								    dump_shard_done,
-								    &g_sios[tok], 0);
+					rc = store_submit_rw(shard_lba(dc->slot, shard),
+							     g_shard_sectors, g_io_bufs[bounce], 1,
+							     dump_shard_done, &g_sios[tok]);
 				} else {
 					rc = reg_rc;
 				}
@@ -1807,11 +2032,9 @@ advance_loads(void)
 			reg_rc = ensure_registered(dst, shard_bytes());
 			if (reg_rc == 0) {
 				/* direct DMA into caller's buffer */
-				rc = spdk_nvme_ns_cmd_read(g_ns, g_qpair, dst,
-							    shard_lba(lc->slot, shard),
-							    g_shard_sectors,
-							    load_shard_done,
-							    &g_sios[tok], 0);
+				rc = store_submit_rw(shard_lba(lc->slot, shard),
+						     g_shard_sectors, dst, 0,
+						     load_shard_done, &g_sios[tok]);
 			} else if (reg_rc == 1) {
 				/* fallback: bounce via internal buffer */
 				int bounce = bounce_buf_pop();
@@ -1820,11 +2043,9 @@ advance_loads(void)
 					break;
 				}
 				g_sios[tok].bounce = bounce;
-				rc = spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_io_bufs[bounce],
-							    shard_lba(lc->slot, shard),
-							    g_shard_sectors,
-							    load_shard_done,
-							    &g_sios[tok], 0);
+				rc = store_submit_rw(shard_lba(lc->slot, shard),
+						     g_shard_sectors, g_io_bufs[bounce], 0,
+						     load_shard_done, &g_sios[tok]);
 			} else {
 				rc = reg_rc;
 			}
@@ -1906,10 +2127,15 @@ check_stall(void)
 static void
 store_poll(void)
 {
-	if (g_qpair != NULL) {
-		spdk_nvme_qpair_process_completions(g_qpair, 0);
+	shm_worker_maintenance();
+	if (g_ipc_mode) {
+		if (g_ipc_ready) { (void)ucm_ipc_client_poll(&g_ipc, 0); }
+	} else {
+		if (g_qpair != NULL) {
+			spdk_nvme_qpair_process_completions(g_qpair, 0);
+		}
+		spdk_nvme_ctrlr_process_admin_completions(g_ctrlr);
 	}
-	spdk_nvme_ctrlr_process_admin_completions(g_ctrlr);
 	advance_dumps();
 	advance_loads();
 	if (!g_stalled) {
@@ -2057,6 +2283,7 @@ store_register_memory(void *addr, uint64_t size)
 {
 	uint64_t start, end;
 	int rc;
+	if (g_ipc_mode) { return -ENOTSUP; }
 	if (g_ctrlr == NULL) { return -ENODEV; }
 
 	if (addr == NULL || size == 0 ||
@@ -2095,6 +2322,48 @@ store_register_memory(void *addr, uint64_t size)
 }
 
 int
+store_register_memory_fd(int fd, void *addr, uint64_t size, uint64_t file_offset)
+{
+	uint64_t start, end;
+	int rc;
+
+	if (!g_ipc_mode) {
+		return store_register_memory(addr, size);
+	}
+	if (!g_ipc_ready || fd < 0 || addr == NULL || size == 0) {
+		return -EINVAL;
+	}
+	start = (uint64_t)(uintptr_t)addr & ~(REG_PAGE_SIZE - 1);
+	end = ((uint64_t)(uintptr_t)addr + size + REG_PAGE_SIZE - 1)
+	      & ~(REG_PAGE_SIZE - 1);
+	for (uint32_t i = 0; i < g_reg_count; i++) {
+		if (start == g_reg_cache[i].start && end == g_reg_cache[i].end) {
+			g_reg_cache[i].refs++;
+			g_direct_dma = 1;
+			return 0;
+		}
+	}
+	if (g_reg_count == REG_CACHE_MAX) {
+		return -ENOSPC;
+	}
+	rc = ucm_ipc_client_register_region(&g_ipc, g_ipc_socket, 1, fd,
+					    size, file_offset);
+	if (rc != 0) {
+		return rc;
+	}
+	g_cache_base = addr;
+	g_cache_size = size;
+	g_cache_fd = fd;
+	g_reg_cache[g_reg_count].start = start;
+	g_reg_cache[g_reg_count].end = end;
+	g_reg_cache[g_reg_count].refs = 1;
+	g_reg_count++;
+	g_reg_total_bytes += end - start;
+	g_direct_dma = 1;
+	return 0;
+}
+
+int
 store_unregister_memory(void *addr, uint64_t size)
 {
 	uint64_t start, end;
@@ -2117,6 +2386,25 @@ store_unregister_memory(void *addr, uint64_t size)
 		if (rc != 0 && !store_io_drained()) {
 			return rc;
 		}
+	}
+	if (g_ipc_mode) {
+		for (uint32_t i = 0; i < g_reg_count; i++) {
+			if (start != g_reg_cache[i].start || end != g_reg_cache[i].end) {
+				continue;
+			}
+			if (--g_reg_cache[i].refs > 0) { return 0; }
+			/* Local release only; the target retains its region until session close. */
+			g_reg_total_bytes -= end - start;
+			g_reg_cache[i] = g_reg_cache[--g_reg_count];
+			if (g_reg_count == 0) {
+				g_cache_base = NULL;
+				g_cache_size = 0;
+				g_cache_fd = -1;
+				g_direct_dma = 0;
+			}
+			return 0;
+		}
+		return -ENOENT;
 	}
 	for (uint32_t i = 0; i < g_reg_count; i++) {
 		if (start != g_reg_cache[i].start || end != g_reg_cache[i].end) {
@@ -2755,7 +3043,8 @@ reactor_start(void)
 	if (g_reactor_started) {
 		return 0;
 	}
-	if (g_ctrlr == NULL || g_qpair == NULL) { return -ENODEV; }
+	if ((!g_ipc_mode && (g_ctrlr == NULL || g_qpair == NULL)) ||
+	    (g_ipc_mode && !g_ipc_ready)) { return -ENODEV; }
 	g_op_ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, OP_RING_SIZE,
 				     SPDK_ENV_NUMA_ID_ANY);
 	if (g_op_ring == NULL) {
@@ -2832,13 +3121,7 @@ sector_batch(uint64_t lba, uint32_t nlbas, void *buf, int is_write)
 	struct batch_io b = {0};
 	int rc;
 
-	if (is_write) {
-		rc = spdk_nvme_ns_cmd_write(g_ns, g_qpair, buf, lba, nlbas,
-					    batch_done, &b, 0);
-	} else {
-		rc = spdk_nvme_ns_cmd_read(g_ns, g_qpair, buf, lba, nlbas,
-					   batch_done, &b, 0);
-	}
+	rc = store_submit_rw(lba, nlbas, buf, is_write, batch_done, &b);
 	if (rc < 0) {
 		return rc;
 	}
@@ -2865,9 +3148,11 @@ store_region_available(uint32_t nslots)
 		return -EINVAL;
 	}
 	for (struct spdk_store_engine *e = process_engines; e != NULL; e = e->next) {
-		if (e == ENGINE || !e->initialized || e->ctrlr != g_ctrlr || e->ns != g_ns) {
+		if (e == ENGINE || !e->initialized || e->ipc_mode != g_ipc_mode) {
 			continue;
 		}
+		if (g_ipc_mode ? strcmp(e->ipc_socket, g_ipc_socket) != 0 :
+		    (e->ctrlr != g_ctrlr || e->ns != g_ns)) { continue; }
 		uint64_t other_end = e->pool_base + (uint64_t)e->nslots * e->slot_sectors;
 		if (g_data_base == e->data_base && nslots == e->nslots &&
 		    g_slot_sectors == e->slot_sectors && g_shard_sectors == e->shard_sectors &&
@@ -3258,6 +3543,7 @@ store_recover(void)
 	uint64_t max_epoch_seen = 0;
 	uint8_t *used;
 	int rc = 0;
+	int was_recovering;
 
 	used = calloc(g_nslots, 1);
 	if (used == NULL) {
@@ -3265,6 +3551,10 @@ store_recover(void)
 	}
 
 	shm_lock();
+	/* Batch reads poll while holding this nonrecursive lock. Preserve the
+	 * entry checks above, but suppress liveness maintenance during rebuild. */
+	was_recovering = g_shm_recovering;
+	g_shm_recovering = 1;
 	memset(g_hash, 0, (size_t)(g_hash_mask + 1) * sizeof(*g_hash));
 	memset(g_shm->workers, 0, sizeof(g_shm->workers));
 	memset(g_pins, 0, g_nslots * sizeof(*g_pins));
@@ -3336,9 +3626,7 @@ store_recover(void)
 		scanned += n;
 	}
 	if (rc != 0) {
-		shm_unlock();
-		free(used);
-		return rc;
+		goto out;
 	}
 
 	/* Rebuild instead of deleting in place: backward-shift can wrap a
@@ -3362,9 +3650,8 @@ store_recover(void)
 			uint32_t nlive = 0;
 
 			if (live == NULL && winners != 0) {
-				shm_unlock();
-				free(used);
-				return -ENOMEM;
+				rc = -ENOMEM;
+				goto out;
 			}
 			for (uint32_t h = 0; h <= g_hash_mask; h++) {
 				if (g_hash[h].used == 1) {
@@ -3388,9 +3675,11 @@ store_recover(void)
 		}
 	}
 	g_epoch = max_epoch_seen + 1;
+out:
+	g_shm_recovering = was_recovering;
 	shm_unlock();
 	free(used);
-	return 0;
+	return rc;
 }
 
 /* ---------------- test helpers ---------------- */
@@ -4681,6 +4970,34 @@ store_device_cleanup(void)
 {
 	/* Stop fences callbacks/DMA before registration or buffer release. */
 	reactor_stop();
+	if (g_ipc_mode) {
+		if (g_ipc_ready) {
+			ucm_ipc_client_close(&g_ipc);
+			g_ipc_ready = 0;
+		}
+		free(g_idx_bufs);
+		g_idx_bufs = NULL;
+		if (g_meta_base != NULL) {
+			munmap(g_meta_base, g_meta_size);
+			g_meta_base = NULL;
+		}
+		if (g_meta_fd >= 0) {
+			close(g_meta_fd);
+			g_meta_fd = -1;
+		}
+		g_meta_size = 0;
+		g_meta_buf = NULL;
+		g_cache_base = NULL;
+		g_cache_size = 0;
+		g_cache_fd = -1;
+		g_reg_count = 0;
+		g_reg_total_bytes = 0;
+		g_direct_dma = 0;
+		shm_close_segment();
+		store_lease_close();
+		store_maintenance_close();
+		goto reset;
+	}
 	if (g_qpair != NULL) {
 		spdk_nvme_ctrlr_free_io_qpair(g_qpair);
 		g_qpair = NULL;
@@ -4718,14 +5035,6 @@ store_device_cleanup(void)
 	g_meta_buf = NULL;
 	g_io_bufs = NULL;
 	g_idx_bufs = NULL;
-	g_io_free_top = 0;
-	g_io_pool_count = 0;
-	g_bounce_free_top = g_bounce_pool_count = 0;
-	g_recov_batch = 0;
-	memset(g_io_free, 0, sizeof(g_io_free));
-	memset(g_bounce_free, 0, sizeof(g_bounce_free));
-	memset(g_sios, 0, sizeof(g_sios));
-	g_idx_free_top = 0;
 	process_reactors_pause(0);
 	if (g_ctrlr != NULL) {
 		struct engine_controller *c = ENGINE->controller;
@@ -4744,6 +5053,16 @@ store_device_cleanup(void)
 		g_ctrlr = NULL;
 		g_ns = NULL;
 	}
+reset:
+	ENGINE->ipc_bridge_free_top = 0;
+	g_io_free_top = 0;
+	g_io_pool_count = 0;
+	g_bounce_free_top = g_bounce_pool_count = 0;
+	g_recov_batch = 0;
+	memset(g_io_free, 0, sizeof(g_io_free));
+	memset(g_bounce_free, 0, sizeof(g_bounce_free));
+	memset(g_sios, 0, sizeof(g_sios));
+	g_idx_free_top = 0;
 	ENGINE->initialized = 0;
 	g_healthy = 1;
 	g_stalled = 0;
@@ -4762,6 +5081,7 @@ store_engine_create(void)
 	struct spdk_store_engine *e = calloc(1, sizeof(*e));
 	if (e == NULL) { return NULL; }
 	e->shm_fd = e->lease_fd = e->maintenance_fd = e->startup_fd = e->gc_fd = -1;
+	e->meta_fd = e->cache_fd = -1;
 	e->worker_slot = -1;
 	e->layers = 27;
 	e->shard_kb = 144;
@@ -4927,33 +5247,44 @@ store_engine_init_session(const char *trid_str, uint32_t nslots_req,
 		}
 	}
 
-	/* 4. probe */
-	stage = "controller";
-	struct engine_controller *c;
-	for (c = process_controllers; c != NULL; c = c->next) {
-		if (spdk_nvme_transport_id_compare(&c->trid, &g_trid) == 0) { break; }
-	}
-	if (c == NULL) {
-		c = calloc(1, sizeof(*c));
-		if (c == NULL) { rc = -ENOMEM; goto fail; }
-		c->ctrlr = spdk_nvme_connect(&g_trid, NULL, 0);
-		if (c->ctrlr == NULL) { free(c); rc = -ENODEV; goto fail; }
-		c->trid = g_trid;
-		c->next = process_controllers;
-		process_controllers = c;
-	}
-	c->refs++;
-	ENGINE->controller = c;
-	attach_cb(ENGINE, &g_trid, c->ctrlr, NULL);
-	if (g_ns == NULL) {
-		rc = -ENODEV;
-		goto fail;
+	if (g_ipc_mode) {
+		stage = "ipc-metadata";
+		rc = store_ipc_meta_setup();
+		if (rc != 0) { goto fail; }
+		stage = "ipc-connect";
+		rc = store_ipc_connect();
+		if (rc != 0) { goto fail; }
+	} else {
+		/* 4. probe */
+		stage = "controller";
+		struct engine_controller *c;
+		for (c = process_controllers; c != NULL; c = c->next) {
+			if (spdk_nvme_transport_id_compare(&c->trid, &g_trid) == 0) { break; }
+		}
+		if (c == NULL) {
+			c = calloc(1, sizeof(*c));
+			if (c == NULL) { rc = -ENOMEM; goto fail; }
+			c->ctrlr = spdk_nvme_connect(&g_trid, NULL, 0);
+			if (c->ctrlr == NULL) { free(c); rc = -ENODEV; goto fail; }
+			c->trid = g_trid;
+			c->next = process_controllers;
+			process_controllers = c;
+		}
+		c->refs++;
+		ENGINE->controller = c;
+		attach_cb(ENGINE, &g_trid, c->ctrlr, NULL);
+		if (g_ns == NULL) {
+			rc = -ENODEV;
+			goto fail;
+		}
 	}
 
 	/* 5. geometry */
 	stage = "geometry";
-	g_sector_size = spdk_nvme_ns_get_sector_size(g_ns);
-	g_num_sectors = spdk_nvme_ns_get_num_sectors(g_ns);
+	if (!g_ipc_mode) {
+		g_sector_size = spdk_nvme_ns_get_sector_size(g_ns);
+		g_num_sectors = spdk_nvme_ns_get_num_sectors(g_ns);
+	}
 	if (g_sector_size == 0 || ((uint64_t)g_shard_kb * 1024) % g_sector_size != 0) {
 		rc = -EINVAL;
 		goto fail;

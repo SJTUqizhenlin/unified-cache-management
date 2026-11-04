@@ -26,6 +26,7 @@ endif()
 
 add_library(ucm_spdk_engine STATIC
     ${SPDK_ENGINE_SOURCE}
+    ${UCM_ROOT_DIR}/testSPDK/ucm_spdk_ipc/ucm_spdk_ipc_client.c
     cc/engine_shim.c
 )
 set_source_files_properties(${SPDK_ENGINE_SOURCE} PROPERTIES
@@ -44,6 +45,7 @@ target_include_directories(ucm_spdk_engine PRIVATE
     ${SPDK_ROOT_DIR}/include
     ${SPDK_ROOT_DIR}/lib/nvme
     ${SPDK_ROOT_DIR}/lib/env_dpdk
+    ${UCM_ROOT_DIR}/testSPDK/ucm_spdk_ipc
 )
 
 set(SPDK_STATIC_LIBS
