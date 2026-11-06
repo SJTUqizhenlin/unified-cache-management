@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# server_test_host.sh — server_test.sh 的宿主机（裸机）适配版
+#
+# 与 pod 版 server_test.sh 的差异：
+#   1. 自动加载宿主机环境：CANN 9.1.0 + conda(vllm-ucm-023) + ENABLE_UCM_PATCH
+#   2. 移除每次启动的 `pip install -e .`：UCM 已 editable 安装，改代码即时生效
+#   3. 缓存目录改为当前用户私有目录（默认 ~/ucm-cache/test），不再使用共享的 /mnt/test
+#   4. 破坏性操作前置安全检查：
+#      - /dev/shm 存在他人 uc_shm_cache* → 中止；本用户残留 → 清理
+#      - 缓存目录必须位于 $HOME 下且属主为本人，才允许清空
+#   5. 修正 pod 硬编码路径（UCM_CONFIG_FILE），配置文件首次自动生成、之后可手工编辑
+#   6. TP 数量自动跟随 DEVICES 数量；启动前预检 6 步（残留自检/构建新旧/Python/模型/端口/UCM 配置）
+#      残留自检 = 关服三查的前置版：默认保留已有孤儿进程、不杀任何已有 NPU 进程；
+#      所选 NPU 被占用时，每隔 NPU_BUSY_RETRY_SECONDS（默认 1800s）重试，直到释放。
+#      KILL_ORPHANS=1 可恢复旧的孤儿进程清理；NPU_BUSY_MAX_RETRIES 可限制重试次数。
+#      构建新旧检查 = C++/构建文件 mtime 新于最新 .so 时自动重编译（覆盖 unstaged 编辑 /
+#      git pull / 切分支三种过期场景）；SKIP_REBUILD=1 跳过；--ucm off 时只提示不重编
+#
+# 用法：
+#   ./server_test_host.sh [--ucm on|off]
+#
+# 环境变量覆盖（例如同时起一个 "plus" 对比实例）：
+#   DEVICES=1,3,5,7 PORT=7880 CACHE_DIR=~/ucm-cache/test-plus ./server_test_host.sh
+#   NPU_BUSY_RETRY_SECONDS=1800 NPU_BUSY_MAX_RETRIES=0 KILL_ORPHANS=0 ./server_test_host.sh
+
+# ---------------- 可调参数 ----------------
+UCM_ENABLED=1
+CACHE_DIR="${CACHE_DIR:-$HOME/ucm-cache/test}"
+# MODEL="${MODEL:-/mnt/model/DeepSeek-V2-Lite-Chat}"
+MODEL="${MODEL:-/mnt/model/DeepSeek-V4-Flash-w8a8-mtp}"
+DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
+PORT="${PORT:-7780}"
+REPO="${REPO:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}"
+# 配置文件放在缓存目录外（避免被清空逻辑误删），按缓存目录名隔离
+UCM_CONFIG="${UCM_CONFIG:-$HOME/ucm-cache/ucm_config_$(basename "${CACHE_DIR%/}").yaml}"
+# NPU 占用策略：
+#   KILL_ORPHANS=0            默认不杀任何已有 NPU 进程（包括上次崩溃遗留的孤儿进程）
+#   NPU_BUSY_RETRY_SECONDS    所选 NPU 被占用时的重试间隔，默认 1800s
+#   NPU_BUSY_MAX_RETRIES      重试次数上限；0 表示一直等，直到 NPU 释放
+KILL_ORPHANS="${KILL_ORPHANS:-0}"
+NPU_BUSY_RETRY_SECONDS="${NPU_BUSY_RETRY_SECONDS:-1800}"
+NPU_BUSY_MAX_RETRIES="${NPU_BUSY_MAX_RETRIES:-0}"
+
+usage() {
+  echo "Usage: $0 [--ucm on|off]"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ucm)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --ucm requires on or off." >&2
+        usage >&2
+        exit 2
+      fi
+      case "$2" in
+        on)  UCM_ENABLED=1 ;;
+        off) UCM_ENABLED=0 ;;
+        *)
+          echo "Error: --ucm must be on or off, got '$2'." >&2
+          usage >&2
+          exit 2
+          ;;
+      esac
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Error: unknown argument '$1'." >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+# ---------------- 环境加载（在 set -e 之前，避免 CANN set_env 的非零返回干扰） ----------------
+source "$HOME/ucm-serve-env-023.sh" || exit 1    # CANN 9.1.0 + vLLM/Ascend 0.23
+export ENABLE_UCM_PATCH="$UCM_ENABLED"          # 覆盖 env 文件默认值，支持 --ucm off
+export PLATFORM=ascend
+export ASCEND_ROOT="$ASCEND_TOOLKIT_HOME"       # Follow the selected CANN, never override with the old path.
+export ASCEND_RT_VISIBLE_DEVICES="$DEVICES"
+export UCM_LOG_PATH="$HOME/ucm-logs/$PORT"
+mkdir -p "$UCM_LOG_PATH" "$HOME/ucm-cache"
+# Preserve native CANN stderr as well as Python logs for crash diagnosis.
+SERVER_LOG="$UCM_LOG_PATH/server_$(date +%Y%m%d_%H%M%S)_$$.log"
+exec > >(tee -a "$SERVER_LOG") 2>&1
+export PYTHONFAULTHANDLER=1
+export PYTHONUNBUFFERED=1
+echo "==> 完整 server stdout/stderr: $SERVER_LOG"
+cd "$REPO"
+
+set -euo pipefail
+
+if ! [[ "$NPU_BUSY_RETRY_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: NPU_BUSY_RETRY_SECONDS 必须是正整数（秒），当前: $NPU_BUSY_RETRY_SECONDS" >&2
+  exit 2
+fi
+if ! [[ "$NPU_BUSY_MAX_RETRIES" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: NPU_BUSY_MAX_RETRIES 必须是非负整数，当前: $NPU_BUSY_MAX_RETRIES" >&2
+  exit 2
+fi
+
+TP=$(awk -F',' '{print NF}' <<< "$DEVICES")
+
+# ---------------- 预检 ----------------
+echo "==> [1/6] 上次实例残留自检（默认保留已有进程；shm / 占卡检查）"
+echo "    NPU 占用策略: KILL_ORPHANS=${KILL_ORPHANS}，BUSY 时间隔 ${NPU_BUSY_RETRY_SECONDS}s 重试（上限 ${NPU_BUSY_MAX_RETRIES}，0=一直等）"
+
+# a) 孤儿进程检查：本用户属主 + PPID=1（父进程已死被 init 接管）的 vllm worker/EngineCore/resource_tracker
+#    默认只报告不清理（KILL_ORPHANS=0）；设 KILL_ORPHANS=1 才恢复旧的 SIGTERM/SIGKILL 清理
+#    活着的 worker 父进程一定是 EngineCore，PPID=1 即为上次崩溃的残留，会占着 NPU 卡导致本次启动失败
+ORPHANS=$(ps -eo pid=,ppid=,uid=,comm=,args= 2>/dev/null | awk -v uid="$(id -u)" '
+  $3 == uid && $2 == 1 {
+    if ($4 ~ /^VLLM::(Worker|EngineCor)/) print $1
+    else if (index($0, "resource_tracker") > 0) print $1
+  }') || ORPHANS=""
+if [[ -n "$ORPHANS" ]]; then
+  if [[ "$KILL_ORPHANS" == "1" ]]; then
+    echo "    发现上次残留的孤儿进程，正在清理: $(echo $ORPHANS | tr '\n' ' ')"
+    kill $ORPHANS 2>/dev/null || true
+    for i in $(seq 1 10); do
+      ALIVE=""
+      for p in $ORPHANS; do [[ -d /proc/$p ]] && ALIVE="$ALIVE $p"; done
+      [[ -z "$ALIVE" ]] && break
+      sleep 1
+    done
+    if [[ -n "${ALIVE:-}" ]]; then
+      echo "    SIGTERM 未退出，升级 SIGKILL:$ALIVE"
+      kill -9 $ALIVE 2>/dev/null || true
+      sleep 2
+    fi
+    echo "    ✓ 孤儿进程已清理"
+  else
+    echo "    发现上次残留的孤儿进程（KILL_ORPHANS=0，保留不杀）: $(echo $ORPHANS | tr '\n' ' ')"
+    echo "    若它们占用所选 NPU，后续将等待 NPU 释放后重试；需要清理请设 KILL_ORPHANS=1"
+  fi
+else
+  echo "    ✓ 无孤儿进程"
+fi
+
+# b) Clean only this user's unused Cache files.
+# sudo lets the inode-based maps/FD check see mappings from other users too.
+if ! timeout 20s sudo -n python3 "$REPO/scripts/cleanup_cache_files.py" \
+    --uid "$(id -u)" --directory /dev/shm; then
+  echo "    WARN: Cache 残留检查未完成，保守保留文件" >&2
+fi
+
+# c) 所选 NPU 的 HBM 基线检查（基线约 3.4GB；>8GB 视为被占用）
+#    注：npu-smi 表格中每张卡两行 —— 第一行含 NPU 编号，第二行（含 Bus-Id）才有 HBM
+#    默认不杀占用者：BUSY 时按 NPU_BUSY_RETRY_SECONDS 等待后重试；
+#    NPU_BUSY_MAX_RETRIES=0 表示一直等到释放。非 BUSY 的检查/解析错误立即退出。
+NPU_RETRY=0
+while :; do
+  # set -e 下不能直接捕获非零退出码，先关闭 errexit 再执行检查
+  set +e
+  HBM_OUTPUT=$(npu-smi info 2>&1 | python "$REPO/scripts/check_npu_hbm.py" --devices "$DEVICES" 2>&1)
+  HBM_RC=$?
+  set -e
+  echo "$HBM_OUTPUT"
+
+  if [[ "$HBM_RC" == "0" ]]; then
+    break
+  fi
+
+  if [[ "$HBM_OUTPUT" != *"BUSY"* ]]; then
+    echo "ERROR: NPU 占用预检失败（非 BUSY，可能是 npu-smi 输出或设备编号错误）；不重试" >&2
+    exit 1
+  fi
+
+  NPU_RETRY=$((NPU_RETRY + 1))
+  if (( NPU_BUSY_MAX_RETRIES > 0 && NPU_RETRY > NPU_BUSY_MAX_RETRIES )); then
+    echo "ERROR: NPU 仍被占用，已达到重试上限 ${NPU_BUSY_MAX_RETRIES} 次；退出" >&2
+    exit 1
+  fi
+  echo "    NPU 被占用，${NPU_BUSY_RETRY_SECONDS}s 后重试（第 ${NPU_RETRY} 次）..."
+  sleep "$NPU_BUSY_RETRY_SECONDS"
+done
+echo "    ✓ 所选 NPU 已释放，继续启动"
+
+echo "==> [2/6] UCM 构建新旧检查（源码 mtime vs 编译产物 .so）"
+# 规则：C++/构建文件的时间戳新于最新 .so → 需要重编（覆盖 unstaged 编辑 / pull / 切分支三种情况）
+# SKIP_REBUILD=1 可跳过；--ucm off 时不重编（不加载 UCM 二进制），仅提示
+if [[ "${SKIP_REBUILD:-0}" == "1" ]]; then
+  echo "    SKIP_REBUILD=1 → 跳过构建检查"
+else
+  # 注意：不能用 "| sort -rn | head -1"（head 提前退出 → sort 收到 SIGPIPE(141) → pipefail 杀脚本），
+  # 用 awk 一站式取最大值（读完全部输入，无提前退出）
+  src_t=$( { find "$REPO/ucm" -type f \( -name '*.cc' -o -name '*.h' -o -name '*.cpp' -o -name '*.hpp' -o -name 'CMakeLists.txt' \) -printf '%T@\n' 2>/dev/null || true
+             stat -c '%Y' "$REPO/CMakeLists.txt" "$REPO/setup.py" "$REPO/version.ini" 2>/dev/null || true; } | \
+           awk '$0+0>m{m=$0+0} END{if(NR>0) printf "%.6f", m}')
+  so_t=$(find "$REPO/ucm" -type f -name '*.so' -printf '%T@\n' 2>/dev/null | \
+           awk '$0+0>m{m=$0+0} END{if(NR>0) printf "%.6f", m}')
+  need=0
+  if [[ -z "$so_t" ]]; then
+    need=1
+    echo "    未找到编译产物 .so → 需要构建"
+  elif awk -v a="${src_t:-0}" -v b="$so_t" 'BEGIN{exit !(a>b)}'; then
+    need=1
+    echo "    源码新于构建产物（$(date -d "@${src_t%.*}" '+%m-%d %H:%M') > $(date -d "@${so_t%.*}" '+%m-%d %H:%M')）→ 需要重编"
+  else
+    echo "    ✓ 构建产物与源码同步（构建于 $(date -d "@${so_t%.*}" '+%m-%d %H:%M')）"
+  fi
+  if [[ "$need" == "1" ]]; then
+    if [[ "$UCM_ENABLED" != "1" ]]; then
+      echo "    --ucm off 本次不加载 UCM 二进制，跳过重编（下次 --ucm on 会自动执行）"
+    else
+      echo "    重编译中（约 4-5 分钟，日志 /tmp/ucm_rebuild.log）..."
+      if ( cd "$REPO" && pip install -e . --no-build-isolation > /tmp/ucm_rebuild.log 2>&1 ); then
+        echo "    ✓ 重编译完成"
+      else
+        echo "ERROR: UCM 重编译失败，日志尾部：" >&2
+        tail -20 /tmp/ucm_rebuild.log >&2
+        exit 1
+      fi
+    fi
+  fi
+fi
+
+echo "==> [3/6] Python 环境预检"
+python - <<'PY'
+import torch, torch_npu, vllm, vllm_ascend  # noqa: F401
+print(f"    torch {torch.__version__} | npu {torch.npu.device_count()} | vllm {vllm.__version__} OK")
+PY
+
+echo "==> [4/6] 模型检查: $MODEL"
+if [[ ! -f "$MODEL/config.json" ]]; then
+  echo "ERROR: 模型不存在或 NFS 未挂载: $MODEL" >&2
+  exit 1
+fi
+
+echo "==> [5/6] 端口检查"
+if ss -tln 2>/dev/null | grep -q ":$PORT "; then
+  echo "ERROR: 端口 $PORT 已被占用（上次服务可能还活着？）" >&2
+  exit 1
+fi
+echo "    ✓ 端口 $PORT 空闲"
+
+if [[ "$UCM_ENABLED" == "1" ]]; then
+  echo "==> [6/6] UCM 缓存目录 / 配置"
+
+  # a) 缓存目录：必须位于 $HOME 下且属主是本人，才允许清空
+  #    KEEP_CACHE=1 跳过磁盘缓存清理（验证跨重启 SSD 命中：重启后同样请求应出现 hit external）
+  #    注：shm 为进程级 buffer，重启后无法复用，仍会清理本用户残留
+  if [[ "${KEEP_CACHE:-0}" == "1" ]]; then
+    echo "    KEEP_CACHE=1 → 保留磁盘缓存 $CACHE_DIR（$(find "$CACHE_DIR" -type f 2>/dev/null | wc -l) 个文件）"
+  else
+    if [[ "$CACHE_DIR" != "$HOME"/* ]]; then
+      echo "ERROR: CACHE_DIR 必须位于 $HOME 之下（当前: $CACHE_DIR）" >&2
+      exit 1
+    fi
+    if [[ -d "$CACHE_DIR" ]]; then
+      if [[ ! -O "$CACHE_DIR" ]]; then
+        echo "ERROR: $CACHE_DIR 属主非当前用户，拒绝清空" >&2
+        exit 1
+      fi
+      echo "    清空缓存目录: $CACHE_DIR"
+      rm -rf "${CACHE_DIR:?}"/*
+    else
+      mkdir -p "$CACHE_DIR"
+    fi
+  fi
+
+  # b) UCM 配置：首次从 example 生成（写入实际缓存路径），之后复用、可手工编辑
+  if [[ ! -f "$UCM_CONFIG" ]]; then
+    sed "s|storage_backends: \"/mnt/test\"|storage_backends: \"$CACHE_DIR\"|" \
+      "$REPO/examples/ucm_config_example.yaml" > "$UCM_CONFIG"
+    echo "    已生成 UCM 配置: $UCM_CONFIG (storage_backends=$CACHE_DIR)"
+  else
+    echo "    复用已有 UCM 配置: $UCM_CONFIG ($(grep storage_backends "$UCM_CONFIG" | sed -n '1p' | tr -d ' '))"
+  fi
+  if ! grep -q "storage_backends" "$UCM_CONFIG"; then
+    echo "ERROR: $UCM_CONFIG 缺少 storage_backends 字段" >&2
+    exit 1
+  fi
+
+  UCM_ARGS=(
+    --kv-transfer-config
+    '{
+      "kv_connector": "UCMConnector",
+      "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
+      "kv_role": "kv_both",
+      "kv_load_failure_policy": "recompute",
+      "kv_connector_extra_config": {
+        "UCM_CONFIG_FILE": "'"$UCM_CONFIG"'"
+      }
+    }'
+  )
+else
+  echo "==> [6/6] UCM 已关闭（--ucm off），跳过缓存配置"
+  UCM_ARGS=()
+fi
+
+echo "==================================================================="
+echo " UCM: $([[ "$UCM_ENABLED" == "1" ]] && echo on || echo off) | model: $(basename "$MODEL")"
+echo " devices: $DEVICES (TP=$TP) | port: $PORT"
+echo " cache: ${CACHE_DIR:-(ucm off)} | UCM log: $UCM_LOG_PATH"
+echo "==================================================================="
+
+MODEL_ARGS=()
+DEFAULT_MAX_MODEL_LEN=65536
+# if [[ "$(basename "${MODEL%/}")" == DeepSeek-V4-Flash* ]]; then
+#   # Start V4 with a bounded profiling workload before testing long contexts.
+#   DEFAULT_MAX_MODEL_LEN=8192
+#   MODEL_ARGS+=(--enable-expert-parallel
+#     --max-num-seqs "${MAX_NUM_SEQS:-4}"
+#     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}")
+#   if [[ "$UCM_ENABLED" == "1" ]]; then
+#     MODEL_ARGS+=(--enable-prefix-caching)
+#   else
+#     MODEL_ARGS+=(--no-enable-prefix-caching)
+#   fi
+# else
+#   MODEL_ARGS+=(--enable-prefix-caching)
+# fi
+
+echo " limits: max_model_len=${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN} gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9} model_args=${MODEL_ARGS[*]}"
+
+exec vllm serve "$MODEL" \
+  --served-model-name "$MODEL" \
+  --max-model-len "${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN}" \
+  --tensor-parallel-size "$TP" --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION:-0.9}" \
+  --block_size 128 --trust-remote-code --port "$PORT" --enforce-eager \
+  "${MODEL_ARGS[@]}" \
+  "${UCM_ARGS[@]}"
