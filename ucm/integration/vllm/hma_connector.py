@@ -22,6 +22,7 @@ except ImportError:  # Older vLLM versions do not expose this helper.
 
 from ucm.integration.vllm.cache_config import configure_cache_capacity
 from ucm.integration.vllm.device import create_device
+from ucm.integration.vllm.mstx_trace import traced, traced_phase
 from ucm.integration.vllm.request_hasher import RequestHasher
 from ucm.integration.vllm.ucm_connector import (
     UCMDirectConnector,
@@ -1671,6 +1672,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             raise RuntimeError(f"Worker FAWA {group_label} layout is empty.")
         return tensor_size_list
 
+    @traced("ucm.fawa.lookup")
     def _lookup_external_hit_blocks(self, external_keys: list[bytes]) -> int:
         """Find the longest reusable prefix present in both FA and WA stores."""
 
@@ -2049,6 +2051,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         preempted_req_ids = set(scheduler_output.preempted_req_ids or ())
         return UCMFAWAConnectorMetadata(requests_dispatch_meta, preempted_req_ids)
 
+    @traced("ucm.fawa.load.submit")
     def _submit_load_task(
         self,
         request_id: str,
@@ -2083,6 +2086,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         )
         self._connector_worker_meta.mark_failed(request_id)
 
+    @traced("ucm.fawa.load.wait")
     def _wait_load_task(
         self,
         load_task: FAWALoadTask,
@@ -2105,6 +2109,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         self._invalid_block_ids = set()
         return res
 
+    @traced("ucm.fawa.dump.submit")
     def _submit_dump_task(
         self,
         label: str,
@@ -2222,6 +2227,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         }
         return all_group_vllm_block_ids
 
+    @traced_phase("ucm.fawa.load")
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
@@ -2294,6 +2300,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         if tasks:
             ucmmetrics.update_stats({"load_bytes_total": load_bytes})
 
+    @traced("ucm.fawa.dump.wait")
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):

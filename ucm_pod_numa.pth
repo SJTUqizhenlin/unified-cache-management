@@ -1,0 +1,1 @@
+import sys, os; exec("try:\n    import ucm.integration.vllm.patch.pod_numa_align_patch\nexcept Exception:\n    pass\n")

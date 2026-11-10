@@ -1,19 +1,34 @@
-# UCM Configuration File Example
-# 
-# This file demonstrates how to configure UCM using YAML.
-# Published UCM Runtime images include this example at /workspace/ucm_config_example.yaml.
-# In a source checkout, use examples/ucm_config_example.yaml instead.
-# You can use this config file by setting its path in kv_connector_extra_config:
-# kv_connector_extra_config={"UCM_CONFIG_FILE": "/workspace/ucm_config_example.yaml"}
-#
-# Alternatively, you can still use kv_connector_extra_config in KVTransferConfig
-# for backward compatibility.
+# You can use this config file by setting the path to this file in kv_connector_extra_config in launch script or command line like this:
+# kv_connector_extra_config={"UCM_CONFIG_FILE": "/workspace/unified-cache-management/examples/ucm_config_example.yaml"}
+
 
 ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
     ucm_connector_config:
+      # V4 FAWA creates two stores automatically; keep exactly one connector entry.
       store_pipeline: "Cache|Posix"
-      storage_backends: "/mnt/test"
-      posix_capacity_gb: 10240
-      posix_io_engine: "psync"
-      posix_data_trans_concurrency: 128
+      # FA/WA use fawa_fa/ and fawa_wa/ below this directory.
+      storage_backends: "/home/qizhenlin/ucm-cache/test"
+      # Total budgets: 500 GiB disk per FA/WA store.
+      posix_capacity_gb: 1000
+      posix_io_engine: "aio"
+      # Local IPC target: the target owns the raw PCIe NVMe; workers submit
+      # through the shared-memory socket.
+      # Single-line local IPC transport: socket | target PCIe trid.
+      spdk_trid: "ipc:/tmp/ucm_spdk_ipc.sock|trtype:PCIe traddr:0000:84:00.0"
+      spdk_capacity_gb: 1000
+      spdk_offset_gib: 0
+      spdk_format: 1
+      cache_buffer_capacity_gb: 40
+      share_buffer_enable: true
+      cache_depth_evict_enable: true
+      shm_hugepage_advise: true
+      # IPC local DMA requires explicit 2 MiB hugepages, not THP.
+      shm_use_hugepage_file: true
+      shm_hugepage_dir: "/dev/hugepages"
+      # Advise transparent huge pages for shared host buffers.
+      io_direct: true
+      shm_partition_enable: false
+
+use_layerwise: false
+mla_using_d2d: false

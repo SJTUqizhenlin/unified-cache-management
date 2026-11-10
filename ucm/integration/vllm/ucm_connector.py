@@ -46,6 +46,7 @@ from ucm.integration.vllm.device import (
     get_current_device_id,
     get_ucm_worker_torch_device,
 )
+from ucm.integration.vllm.mstx_trace import traced, traced_phase, ucm_range
 from ucm.integration.vllm.metrics import (
     UCM_HAS_PROM_METRICS,
     UCMConnectorStats,
@@ -3002,6 +3003,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 first_layer_load_start,
             )
 
+    @traced("ucm.load.wait_layer")
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self._connector_metadata:
             return
@@ -3221,7 +3223,8 @@ class UCMCPConnector(UCMLayerWiseConnector):
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if self.use_layerwise:
-            super().wait_for_layer_load(layer_name)
+            with ucm_range("ucm.load.wait_layer"):
+                super().wait_for_layer_load(layer_name)
         else:
             pass
 
@@ -3766,6 +3769,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             per_engine_labelvalues,
         )
 
+    @traced("ucm.lookup")
     @_record_connector_interface_duration
     def get_num_new_matched_tokens(
         self,
@@ -3883,6 +3887,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         """
         return self.connector.has_connector_metadata()
 
+    @traced_phase("ucm.load")
     @_record_connector_interface_duration
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """
@@ -3915,6 +3920,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         """
         self.connector.wait_for_layer_load(layer_name)
 
+    @traced("ucm.dump.layer")
     @_record_connector_interface_duration
     def save_kv_layer(
         self,
@@ -3937,6 +3943,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         """
         self.connector.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
 
+    @traced("ucm.dump.wait")
     @_record_connector_interface_duration
     def wait_for_save(self) -> None:
         """
