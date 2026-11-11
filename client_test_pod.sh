@@ -3,10 +3,9 @@
 #
 # 与 client_test_host.sh 的差异（仅环境适配套路不同）：
 #   1. 环境加载：Pod 镜像已预置 CANN/vLLM；没有 ~/ucm-serve-env-023.sh 时直接复用当前环境
-#   2. trace 自动选址：优先 syfi_coding_small_64k_replay.jsonl（Pod 共享目录，
-#      272 请求 / 271s，最大 input+output 56872 token，可全量回放）；
-#      否则宿主机用 ~/downloads/traces/syfi_coding_large_64k_replay.jsonl，
-#      Pod 再退回 /workspace-genet/Downloads/synthetic_trace.jsonl；
+#   2. 默认 GLM-5.2-W4A8 使用 hot_prefix_4k_64_s7.jsonl（最大总长 4224），
+#      匹配服务端首轮 8K 上下文；不存在时生成独立的 4K 合成 trace。
+#      其他模型优先 small/large 64k trace，再退回 synthetic_trace.jsonl；
 #      synthetic_trace 含 >64k 请求时默认切前 REPLAY_WINDOW_SEC=30 秒（108 请求）；
 #      切片与回放缓存隔离在 $TRACE_DIR/work/，不动源 trace；超长请求校验失败时退出，不自动过滤
 #   3. 端口检查：Pod 常无 iproute2/net-tools，port_in_use() 自动降级到 /proc/net/tcp
@@ -57,8 +56,7 @@ PY
 # ---------------- 可调参数 ----------------
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-7780}"
-# MODEL="${MODEL:-/mnt/model/DeepSeek-V2-Lite-Chat}"
-MODEL="${MODEL:-/mnt/model/DeepSeek-V4-Flash-w8a8-mtp}"
+MODEL="${MODEL:-/mnt/model/GLM-5.2-w4a8}"
 REPO="${REPO:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}"
 # trace 目录：宿主机优先 ~/downloads/traces；pod 里共享目录通常是 /workspace-genet/Downloads
 if [[ -z "${TRACE_DIR:-}" ]]; then
@@ -70,11 +68,16 @@ if [[ -z "${TRACE_DIR:-}" ]]; then
     TRACE_DIR="$HOME/downloads/traces"
   fi
 fi
-# trace 文件：优先 small 64k 回放集；否则沿用宿主机 large trace；
-# Pod 里再退回共享目录的 Mooncake synthetic trace。
+# 显式 TRACE_FILE 优先。GLM 默认短 trace；长上下文测试需同时提高服务端上限。
 if [[ -z "${TRACE_FILE:-}" ]]; then
-  if [[ -f "$TRACE_DIR/hot_prefix_8k_128_s14.jsonl.jsonl" ]]; then
-    TRACE_FILE="$TRACE_DIR/hot_prefix_8k_128_s14.jsonl.jsonl"
+  if [[ "$(basename "${MODEL%/}")" == GLM-5.2-w4a8 ]]; then
+    if [[ -f "$TRACE_DIR/hot_prefix_4k_64_s7.jsonl" ]]; then
+      TRACE_FILE="$TRACE_DIR/hot_prefix_4k_64_s7.jsonl"
+    else
+      TRACE_FILE="$TRACE_DIR/glm52_prefix_4k_replay.jsonl"
+    fi
+  elif [[ -f "$TRACE_DIR/syfi_coding_small_64k_replay.jsonl" ]]; then
+    TRACE_FILE="$TRACE_DIR/syfi_coding_small_64k_replay.jsonl"
   elif [[ -f "$TRACE_DIR/syfi_coding_large_64k_replay.jsonl" ]]; then
     TRACE_FILE="$TRACE_DIR/syfi_coding_large_64k_replay.jsonl"  # 自选agentic trace
   elif [[ -f "$TRACE_DIR/synthetic_trace.jsonl" ]]; then
@@ -97,9 +100,9 @@ if [[ -z "${REPLAY_WINDOW_SEC:-}" ]]; then
 fi
 # 合成 trace 参数（仅在 TRACE_FILE 不存在时兜底生成）
 GEN_REQUESTS="${GEN_REQUESTS:-12}"        # 请求数
-GEN_INPUT_LEN="${GEN_INPUT_LEN:-16384}"   # 每请求输入 token 数
+GEN_INPUT_LEN="${GEN_INPUT_LEN:-4096}"    # 每请求输入 token 数
 GEN_OUTPUT_LEN="${GEN_OUTPUT_LEN:-128}"   # 每请求输出 token 数
-GEN_SHARED_BLOCKS="${GEN_SHARED_BLOCKS:-24}"  # 共享前缀块数（×512 token，需 < GEN_INPUT_LEN/512）
+GEN_SHARED_BLOCKS="${GEN_SHARED_BLOCKS:-6}"  # 共享前缀块数（×512 token，需 < GEN_INPUT_LEN/512）
 
 SMOKE=1
 REPLAY=1
@@ -169,7 +172,7 @@ for i in $(seq 1 60); do
     break
   fi
   if [[ $i -eq 60 ]]; then
-    echo "ERROR: 服务 $HOST:$PORT 不可用（先在另一个终端运行 ./server_test_host.sh）" >&2
+    echo "ERROR: 服务 $HOST:$PORT 不可用（先在另一个终端运行 ./server_test_pod.sh）" >&2
     exit 1
   fi
   sleep 5
@@ -189,7 +192,7 @@ echo "    trace input cap: MAX_INPUT_LEN=$MAX_INPUT_LEN (0 = server limit only)"
 
 # ---------------- 冒烟测试：同一请求发两次，观察 cache 命中 ----------------
 if [[ "$SMOKE" == "1" ]]; then
-  echo "==> [2/3] 冒烟测试：相同请求发两次（#1 = cache miss，#2 = cache hit）"
+  echo "==> [2/3] 冒烟测试：相同请求发两次（第二次可能命中 HBM prefix cache）"
   echo "    优先 /v1/chat/completions（chat 模型自动套模板，输出正常文本），"
   echo "    失败则退回 /v1/completions（base 模型）"
   PAYLOAD=$(mktemp /tmp/ucm_smoke_XXXXXX.json)
@@ -229,7 +232,12 @@ EOF
   fi
   sleep 1
   smoke_request 2
+  jq -e '.choices | type == "array" and length > 0' /tmp/ucm_smoke_resp.json >/dev/null || {
+    echo "ERROR: 冒烟请求失败，请检查响应 /tmp/ucm_smoke_resp.json 和服务端日志" >&2
+    exit 1
+  }
   echo "    提示：UCM 命中日志在服务端 ~/ucm-logs/$PORT/ （grep 'hit external'）"
+  echo "    验证外部缓存：KEEP_CACHE=1 重启同配置服务，再发送相同前缀并检查外部加载指标。"
 fi
 
 # ---------------- trace 回放压测 ----------------

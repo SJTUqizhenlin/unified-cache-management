@@ -27,12 +27,13 @@
 #   NPU_BUSY_RETRY_SECONDS=1800 NPU_BUSY_MAX_RETRIES=0 KILL_ORPHANS=0 ./server_test_pod.sh
 #   MSPROF=1 MSPROF_OUTPUT=/root/prof/vllm ./server_test_pod.sh
 #   MSPROF_EXTRA_ARGS="--aic-metrics=MemoryAccess" MSPROF=1 ./server_test_pod.sh
+#   MAX_MODEL_LEN=32768 MAX_NUM_SEQS=4 ./server_test_pod.sh
+#   默认 GLM-5.2-W4A8：TP8 + EP，8K 上下文，单序列，eager，无 MTP/C8。
 
 # ---------------- 可调参数 ----------------
 UCM_ENABLED=1
 CACHE_DIR="${CACHE_DIR:-$HOME/ucm-cache/test}"
-# MODEL="${MODEL:-/mnt/model/DeepSeek-V2-Lite-Chat}"
-MODEL="${MODEL:-/mnt/model/DeepSeek-V4-Flash-w8a8-mtp}"
+MODEL="${MODEL:-/mnt/model/GLM-5.2-w4a8}"
 DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
 PORT="${PORT:-7780}"
 REPO="${REPO:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")}"
@@ -49,6 +50,10 @@ NPU_BUSY_MAX_RETRIES="${NPU_BUSY_MAX_RETRIES:-0}"
 KV_LOAD_FAILURE_POLICY="${KV_LOAD_FAILURE_POLICY:-fail}"
 # Posix store 的 GC 预算（GiB）；留空时沿用配置里的值，但若超过缓存目录可用空间会自动收敛。
 POSIX_CAPACITY_GB="${POSIX_CAPACITY_GB:-}"
+# GLM-5.2 的 store block 很大（约 14MB），data_dir_shard_bytes=3 会生成 16^3=4096 个
+# 分片目录，GC 最低容量门槛约 805GiB。小盘默认收敛到 2（256 个目录，门槛约 51GiB）；
+# 设为 1（16 个目录）或 0（单 data 目录）可进一步降低门槛。
+DATA_DIR_SHARD_BYTES="${DATA_DIR_SHARD_BYTES:-2}"
 # UCM Cache 共享缓冲区容量（GiB）；留空沿用 YAML。Pod 的 2MiB hugepage 限额需 >= 此值，
 # 否则 memfd 会回退到 4K base pages（可运行但性能变差，并加重 migratepages）。
 CACHE_BUFFER_CAPACITY_GB="${CACHE_BUFFER_CAPACITY_GB:-}"
@@ -408,8 +413,12 @@ if [[ "$UCM_ENABLED" == "1" ]]; then
 
   # b) UCM 配置：首次从 example 生成；已有配置允许复用，但会自动修正失效的 storage_backends。
   if [[ ! -f "$UCM_CONFIG" ]]; then
+    CONFIG_TEMPLATE="$REPO/examples/ucm_config_example.yaml"
+    if [[ "$(basename "${MODEL%/}")" == GLM-5.2-w4a8 ]]; then
+      CONFIG_TEMPLATE="$REPO/examples/ucm_config_glm52_pod.yaml"
+    fi
     sed -E "s|^([[:space:]]*storage_backends:[[:space:]]*).*|\1\"$CACHE_DIR\"|" \
-      "$REPO/examples/ucm_config_example.yaml" > "$UCM_CONFIG"
+      "$CONFIG_TEMPLATE" > "$UCM_CONFIG"
     echo "    已生成 UCM 配置: $UCM_CONFIG (storage_backends=$CACHE_DIR)"
   else
     echo "    复用已有 UCM 配置: $UCM_CONFIG"
@@ -427,6 +436,25 @@ if [[ "$UCM_ENABLED" == "1" ]]; then
     echo "    已修正 UCM storage_backends: ${CONFIG_BACKEND:-<empty>} -> $CACHE_DIR"
   fi
   mkdir -p "$CACHE_DIR"
+
+  # GLM-5.2：降低 Posix 分片目录数量，避免 GC 因 block 太大而要求超大容量。
+  # data_dir_shard_bytes=N 对应 16^N 个目录；旧配置没有该字段时自动补上。
+  if [[ "$(basename "${MODEL%/}")" == GLM-5.2-w4a8 ]]; then
+    CONFIG_SHARD_BYTES=$(sed -nE \
+      's|^[[:space:]]*data_dir_shard_bytes:[[:space:]]*([0-9]+).*|\1|p' \
+      "$UCM_CONFIG" | head -1)
+    if [[ -z "$CONFIG_SHARD_BYTES" ]]; then
+      sed -i -E \
+        "s|^([[:space:]]*)(posix_capacity_gb:.*)$|\1\2\n\1data_dir_shard_bytes: $DATA_DIR_SHARD_BYTES|" \
+        "$UCM_CONFIG"
+      echo "    UCM data_dir_shard_bytes: unset -> $DATA_DIR_SHARD_BYTES（降低 GLM-5.2 GC 容量门槛）"
+    elif [[ "$CONFIG_SHARD_BYTES" != "$DATA_DIR_SHARD_BYTES" ]]; then
+      sed -i -E \
+        "s|^([[:space:]]*data_dir_shard_bytes:[[:space:]]*)[0-9]+.*|\1$DATA_DIR_SHARD_BYTES|" \
+        "$UCM_CONFIG"
+      echo "    UCM data_dir_shard_bytes: $CONFIG_SHARD_BYTES -> $DATA_DIR_SHARD_BYTES（降低 GLM-5.2 GC 容量门槛）"
+    fi
+  fi
 
   # posix_capacity_gb 是 Posix store 的 GC 预算（HMA 会再对 FA/WA 各分一半），不是预分配；
   # 但预算超过实际可用空间会在写满时触发 ENOSPC，因此这里默认收敛到可用空间的 90%。
@@ -545,26 +573,33 @@ echo "==================================================================="
 
 MODEL_ARGS=()
 DEFAULT_MAX_MODEL_LEN=65536
-# vllm-ascend 的 enable_cpu_binding 默认开启；关闭它以避免启动末尾的 migratepages 卡死。
+# CPU/IRQ 绑核保留；启动补丁单独禁用 migratepages。
 if [[ "$ENABLE_CPU_BINDING" == "1" ]]; then
   MODEL_ARGS+=(--additional-config '{"enable_cpu_binding": true}')
 else
   MODEL_ARGS+=(--additional-config '{"enable_cpu_binding": false}')
 fi
-# if [[ "$(basename "${MODEL%/}")" == DeepSeek-V4-Flash* ]]; then
-#   # Start V4 with a bounded profiling workload before testing long contexts.
-#   DEFAULT_MAX_MODEL_LEN=8192
-#   MODEL_ARGS+=(--enable-expert-parallel
-#     --max-num-seqs "${MAX_NUM_SEQS:-4}"
-#     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}")
-#   if [[ "$UCM_ENABLED" == "1" ]]; then
-#     MODEL_ARGS+=(--enable-prefix-caching)
-#   else
-#     MODEL_ARGS+=(--no-enable-prefix-caching)
-#   fi
-# else
-#   MODEL_ARGS+=(--enable-prefix-caching)
-# fi
+if [[ "$(basename "${MODEL%/}")" == GLM-5.2-w4a8 ]]; then
+  DEFAULT_MAX_MODEL_LEN=8192
+  # 只使用 checkpoint 自带的 shared-indexer 配置；不覆盖 index_topk_freq/offset。
+  # W4A8 权重量化与 C8 KV 量化独立；首轮使用 auto KV dtype，不启用 MTP。
+  export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
+  export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-200}"
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+  MODEL_ARGS+=(--quantization ascend --enable-expert-parallel
+    --max-num-seqs "${MAX_NUM_SEQS:-1}"
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-2048}"
+    --enable-chunked-prefill --kv-cache-dtype auto)
+else
+  if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
+    MODEL_ARGS+=(--max-num-seqs "$MAX_NUM_SEQS")
+  fi
+  if [[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]]; then
+    MODEL_ARGS+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
+  fi
+fi
+# UCM on/off 使用相同的 HBM prefix cache 策略，便于对比外部缓存收益。
+MODEL_ARGS+=(--enable-prefix-caching)
 
 echo " limits: max_model_len=${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN} gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.9} model_args=${MODEL_ARGS[*]}"
 

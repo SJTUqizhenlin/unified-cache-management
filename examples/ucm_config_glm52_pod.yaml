@@ -1,0 +1,25 @@
+# GLM-5.2-W4A8, TP8, BF16 KV, direct whole-block offload.
+# server_test_pod.sh substitutes storage_backends with CACHE_DIR on first launch.
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "Cache|Posix"
+      storage_backends: "/root/ucm-cache/test"
+      # Disk GC budget, not preallocation; server also caps it to available space.
+      posix_capacity_gb: 128
+      # GLM-5.2 store blocks are large (~14MB). Default 3 means 16^3=4096 shard
+      # dirs, which makes GC require ~805GiB minimum capacity. Use 2 (256 dirs,
+      # ~51GiB min) so a smaller disk can still enable GC. 
+      data_dir_shard_bytes: 2
+      posix_io_engine: "aio"
+      cache_buffer_capacity_gb: 50
+      share_buffer_enable: true
+      cache_depth_evict_enable: true
+      shm_hugepage_advise: true
+      # This Pod has no /dev/hugepages mount. Use memfd with THP advice.
+      shm_use_hugepage_file: false
+      io_direct: true
+      shm_partition_enable: false
+
+# Direct mode packs only real MLA/indexer tensors, including shared-indexer layers.
+use_layerwise: true
